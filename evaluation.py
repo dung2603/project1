@@ -1,147 +1,59 @@
+# metric.py
+
 import torch
-import numpy as np
 
-def mask_depth( target, min_depth=1e-3, max_depth=10):
+def compute_metrics(pred, gt, mask=None):
     """
-    Tạo mặt nạ để loại bỏ các giá trị không hợp lệ trong bản đồ độ sâu.
+    Compute depth estimation metrics between predicted and ground truth depths.
 
-    :param pred: Bản đồ độ sâu dự đoán (B, 1, H, W)
-    :param target: Bản đồ độ sâu thực tế (B, 1, H, W)
-    :param min_depth: Giá trị độ sâu tối thiểu để tính toán
-    :param max_depth: Giá trị độ sâu tối đa để tính toán
-    :return: Mặt nạ boolean với kích thước (B, H, W)
+    Args:
+        pred (torch.Tensor): Predicted depth map of shape (B, 1, H, W)
+        gt (torch.Tensor): Ground truth depth map of shape (B, 1, H, W)
+        mask (torch.Tensor): Optional mask of shape (B, 1, H, W) where True indicates valid pixels
+
+    Returns:
+        dict: Dictionary containing computed metrics
     """
-    mask = (target > min_depth) & (target < max_depth)
-    return mask
+    # Ensure pred and gt have the same shape
+    assert pred.shape == gt.shape, "Predicted and ground truth depths must have the same shape"
 
-def compute_mae(pred, target, mask=None):
-    """
-    Tính toán Mean Absolute Error (MAE).
+    # Flatten tensors and apply mask if provided
+    if mask is not None:
+        valid_mask = mask.bool()
+        pred = pred[valid_mask]
+        gt = gt[valid_mask]
+    else:
+        pred = pred.view(-1)
+        gt = gt.view(-1)
 
-    :param pred: Bản đồ độ sâu dự đoán (B, 1, H, W)
-    :param target: Bản đồ độ sâu thực tế (B, 1, H, W)
-    :param mask: Mặt nạ boolean để loại bỏ các giá trị không hợp lệ (B, H, W)
-    :return: Giá trị MAE trung bình
-    """
-    pred = pred.squeeze()
-    target = target.squeeze()
+    # Avoid division by zero and log of zero
+    epsilon = 1e-6
+    pred = torch.clamp(pred, min=epsilon)
+    gt = torch.clamp(gt, min=epsilon)
 
-    if mask is None:
-        mask = target > 0
+    # Compute absolute relative error
+    abs_rel = torch.mean(torch.abs(gt - pred) / gt)
 
-    mae = torch.abs(pred - target)[mask].mean().item()
-    return mae
+    # Compute RMSE
+    rmse = torch.sqrt(torch.mean((gt - pred) ** 2))
 
-def compute_rmse(pred, target, mask=None):
-    """
-    Tính toán Root Mean Squared Error (RMSE).
+    # Compute log10 error
+    log10 = torch.mean(torch.abs(torch.log10(gt) - torch.log10(pred)))
 
-    :param pred: Bản đồ độ sâu dự đoán (B, 1, H, W)
-    :param target: Bản đồ độ sâu thực tế (B, 1, H, W)
-    :param mask: Mặt nạ boolean để loại bỏ các giá trị không hợp lệ (B, H, W)
-    :return: Giá trị RMSE trung bình
-    """
-    pred = pred.squeeze()
-    target = target.squeeze()
-
-    if mask is None:
-        mask = target > 0
-
-    rmse = torch.sqrt(torch.mean((pred - target) ** 2)[mask]).item()
-    return rmse
-
-def compute_abs_rel(pred, target, mask=None):
-    """
-    Tính toán Absolute Relative Error (Abs Rel).
-
-    :param pred: Bản đồ độ sâu dự đoán (B, 1, H, W)
-    :param target: Bản đồ độ sâu thực tế (B, 1, H, W)
-    :param mask: Mặt nạ boolean để loại bỏ các giá trị không hợp lệ (B, H, W)
-    :return: Giá trị Abs Rel trung bình
-    """
-    pred = pred.squeeze()
-    target = target.squeeze()
-
-    if mask is None:
-        mask = target > 0
-
-    abs_rel = torch.mean(torch.abs(pred - target) / target)[mask].item()
-    return abs_rel
-
-def compute_delta(pred, target, mask=None, delta=1.25):
-    """
-    Tính toán tỷ lệ Accuracy với các ngưỡng δ < 1.25, δ < 1.25², δ < 1.25³.
-
-    :param pred: Bản đồ độ sâu dự đoán (B, 1, H, W)
-    :param target: Bản đồ độ sâu thực tế (B, 1, H, W)
-    :param mask: Mặt nạ boolean để loại bỏ các giá trị không hợp lệ (B, H, W)
-    :param delta: Ngưỡng delta (ví dụ: 1.25, 1.25², 1.25³)
-    :return: Giá trị tỷ lệ accuracy
-    """
-    pred = pred.squeeze()
-    target = target.squeeze()
-
-    if mask is None:
-        mask = target > 0
-
-    ratio = torch.max(pred / target, target / pred)
-    delta_accuracy = torch.mean((ratio < delta).float())[mask].item()
-    return delta_accuracy
-
-def compute_all_metrics(pred, target, mask=None, delta_values=[1.25, 1.25**2, 1.25**3]):
-    """
-    Tính toán tất cả các chỉ số lỗi cho bản đồ độ sâu dự đoán và thực tế.
-
-    :param pred: Bản đồ độ sâu dự đoán (B, 1, H, W)
-    :param target: Bản đồ độ sâu thực tế (B, 1, H, W)
-    :param mask: Mặt nạ boolean để loại bỏ các giá trị không hợp lệ (B, H, W)
-    :param delta_values: Danh sách các giá trị delta để tính accuracy
-    :return: Dictionary chứa các chỉ số lỗi
-    """
-    mae = compute_mae(pred, target, mask)
-    rmse = compute_rmse(pred, target, mask)
-    abs_rel = compute_abs_rel(pred, target, mask)
-
-    delta_metrics = {}
-    for delta in delta_values:
-        delta_key = f"delta<{delta}"
-        delta_metrics[delta_key] = compute_delta(pred, target, mask, delta)
+    # Compute threshold accuracy
+    max_ratio = torch.max(pred / gt, gt / pred)
+    delta = max_ratio
+    a1 = (delta < 1.25).float().mean()
+    a2 = (delta < 1.25 ** 2).float().mean()
+    a3 = (delta < 1.25 ** 3).float().mean()
 
     metrics = {
-        'mae': mae,
-        'rmse': rmse,
-        'abs_rel': abs_rel,
+        'abs_rel': abs_rel.item(),
+        'rmse': rmse.item(),
+        'log10': log10.item(),
+        'a1': a1.item(),
+        'a2': a2.item(),
+        'a3': a3.item(),
     }
-    metrics.update(delta_metrics)
 
     return metrics
-
-if __name__ == "__main__":
-    # Ví dụ sử dụng các hàm trong metrics.py
-    import torch
-
-    # Tạo các tensor giả lập
-    pred = torch.tensor([[[[1.0, 2.0], [3.0, 4.0]]]])  # Shape: (1, 1, 2, 2)
-    target = torch.tensor([[[[1.5, 2.5], [3.5, 4.5]]]])  # Shape: (1, 1, 2, 2)
-
-    # Tạo mặt nạ
-    mask = mask_depth(pred, target)
-
-    # Tính các chỉ số
-    mae = compute_mae(pred, target, mask)
-    rmse = compute_rmse(pred, target, mask)
-    abs_rel = compute_abs_rel(pred, target, mask)
-    delta1 = compute_delta(pred, target, mask, delta=1.25)
-    delta2 = compute_delta(pred, target, mask, delta=1.25**2)
-    delta3 = compute_delta(pred, target, mask, delta=1.25**3)
-
-    print(f"MAE: {mae}")
-    print(f"RMSE: {rmse}")
-    print(f"Abs Rel: {abs_rel}")
-    print(f"Delta < 1.25: {delta1}")
-    print(f"Delta < 1.25^2: {delta2}")
-    print(f"Delta < 1.25^3: {delta3}")
-
-    # Tính tất cả các chỉ số cùng một lúc
-    all_metrics = compute_all_metrics(pred, target, mask)
-    print("All Metrics:", all_metrics)
