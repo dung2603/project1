@@ -13,13 +13,13 @@ import torch.nn.functional as F
 from model.model import CombinedDepthModel
 from dataloader import DataLoadPreprocess
 from evaluation import compute_metrics
-
-# Import các hàm loss từ file loss.py
 from loss import DepthLoss
 
 from torchvision import transforms
 from torch.utils.tensorboard import SummaryWriter
 
+
+# train.py
 
 class BaseTrainer:
     def __init__(
@@ -32,10 +32,10 @@ class BaseTrainer:
         min_depth=0.1,
         max_depth=10.0,
         early_stopping_patience=10,
-        initial_lr=1e-6,
-        fine_tune_lr=1e-7,
+        initial_lr=1e-4,  # Điều chỉnh learning rate phù hợp
         weight_decay=1e-4,
-        max_grad_norm=1.0
+        max_grad_norm=1.0,
+        validation_interval=0.25  # Thực hiện đánh giá cứ mỗi 25% một epoch
     ):
 
         self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -47,12 +47,13 @@ class BaseTrainer:
         self.max_depth = max_depth
         self.early_stopping_patience = early_stopping_patience
         self.max_grad_norm = max_grad_norm
+        self.validation_interval = validation_interval  # Lưu tham số này
 
-        self.optimizer = self._init_optimizer(initial_lr, fine_tune_lr, weight_decay)
+        self.optimizer = self._init_optimizer(initial_lr, weight_decay)
         self.scheduler = self._init_scheduler()
 
         # Sử dụng hàm loss tổng hợp từ loss.py và di chuyển nó sang thiết bị đúng
-        self.criterion = DepthLoss(alpha=1.0, beta=1.0, gamma=1.0, delta=1.0).to(self.device)
+        self.criterion = DepthLoss(alpha=1.0, beta=0.1, delta=0.1).to(self.device)
 
         self.best_val_loss = float('inf')
         self.epochs_no_improve = 0
@@ -60,12 +61,11 @@ class BaseTrainer:
         # Thiết lập TensorBoard
         self.writer = SummaryWriter('runs/depth_estimation_experiment')
 
-    def _init_optimizer(self, initial_lr, fine_tune_lr, weight_decay):
+    def _init_optimizer(self, initial_lr, weight_decay):
         """
-        Khởi tạo trình tối ưu hóa AdamW với learning rate khác nhau cho backbone và phần còn lại.
+        Khởi tạo trình tối ưu hóa AdamW với learning rate.
         """
-        fine_tune_params = [param for param in self.model.parameters() if param.requires_grad]
-        optimizer = optim.AdamW(fine_tune_params, lr=initial_lr, weight_decay=weight_decay)
+        optimizer = optim.AdamW(self.model.parameters(), lr=initial_lr, weight_decay=weight_decay)
         return optimizer
 
     def _init_scheduler(self):
@@ -90,6 +90,10 @@ class BaseTrainer:
             self.model.train()
             self.optimizer.zero_grad()
             depth_map = self.model(images)
+
+            # Thêm ReLU để đảm bảo depth_map luôn dương
+            depth_map = F.relu(depth_map)
+
             depth_map = self._resize_depth_map(depth_map, depths)
 
             # Apply mask for valid depth values
@@ -98,8 +102,22 @@ class BaseTrainer:
                 depth_map = depth_map * mask
                 depths = depths * mask
 
+            # Kiểm tra các giá trị depth_map và depths để tránh NaN
+            if torch.isnan(depth_map).any() or torch.isnan(depths).any():
+                print("NaN detected in depth_map or depths")
+                return {'total_loss': float('nan')}
+
+            if (depth_map <= 0).any():
+                print("Non-positive values detected in depth_map after ReLU")
+                return {'total_loss': float('nan')}
+
             # Tính toán loss sử dụng hàm loss tổng hợp
             total_loss = self.criterion(depth_map, depths)
+
+            # Kiểm tra loss
+            if torch.isnan(total_loss).item():
+                print("NaN detected in total_loss")
+                return {'total_loss': float('nan')}
 
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.max_grad_norm)
@@ -117,6 +135,10 @@ class BaseTrainer:
             self.model.eval()
             with torch.no_grad():
                 depth_map = self.model(images)
+
+                # Thêm ReLU để đảm bảo depth_map luôn dương
+                depth_map = F.relu(depth_map)
+
                 depth_map = self._resize_depth_map(depth_map, depths)
 
                 # Apply mask for valid depth values
@@ -125,8 +147,18 @@ class BaseTrainer:
                     depth_map = depth_map * mask
                     depths = depths * mask
 
+                # Kiểm tra các giá trị depth_map và depths để tránh NaN
+                if torch.isnan(depth_map).any() or torch.isnan(depths).any():
+                    print("NaN detected in depth_map or depths during validation")
+                    return {'total_loss': float('nan')}
+
                 # Tính toán loss sử dụng hàm loss tổng hợp
                 total_loss = self.criterion(depth_map, depths)
+
+                # Kiểm tra loss
+                if torch.isnan(total_loss).item():
+                    print("NaN detected in total_loss during validation")
+                    return {'total_loss': float('nan')}
 
                 # Compute metrics using compute_metrics from evaluation.py
                 metrics = compute_metrics(depth_map, depths, mask=mask)
@@ -175,9 +207,10 @@ class BaseTrainer:
         """
         return self._process_batch(batch, training=False)
 
-    def validate(self):
+    def validate(self, is_final=False):
         """
         Đánh giá mô hình trên toàn bộ bộ dữ liệu đánh giá.
+        Tham số `is_final` xác định xem đây có phải là đánh giá cuối cùng của epoch hay không.
         """
         if self.test_loader is None:
             print("Không có bộ dữ liệu đánh giá (test_loader) được cung cấp.")
@@ -206,19 +239,20 @@ class BaseTrainer:
             for metric_name, metric_value in avg_metrics.items():
                 self.writer.add_scalar(f'Validation/Averages/{metric_name}', metric_value, self.global_step)
 
-        # Update scheduler based on validation loss
-        self.scheduler.step(avg_val_loss)
+        if is_final:
+            # Update scheduler based on validation loss
+            self.scheduler.step(avg_val_loss)
 
-        # Early Stopping
-        if avg_val_loss < self.best_val_loss:
-            self.best_val_loss = avg_val_loss
-            self.epochs_no_improve = 0
-            self.save_checkpoint('best_model.pth')
-        else:
-            self.epochs_no_improve += 1
-            if self.epochs_no_improve >= self.early_stopping_patience:
-                print(f"Early stopping triggered after {self.epochs_no_improve} epochs with no improvement.")
-                raise StopIteration
+            # Early Stopping
+            if avg_val_loss < self.best_val_loss:
+                self.best_val_loss = avg_val_loss
+                self.epochs_no_improve = 0
+                self.save_checkpoint('best_model.pth')
+            else:
+                self.epochs_no_improve += 1
+                if self.epochs_no_improve >= self.early_stopping_patience:
+                    print(f"Early stopping triggered after {self.epochs_no_improve} epochs with no improvement.")
+                    raise StopIteration
 
     def train_epoch(self, epoch):
         """
@@ -228,19 +262,34 @@ class BaseTrainer:
         train_losses = []
         num_batches = len(self.train_loader)
 
+        # Tính số batch tương ứng với validation_interval (25%)
+        interval = int(num_batches * self.validation_interval)
+        if interval == 0:
+            interval = 1  # Đảm bảo ít nhất 1 batch trước khi đánh giá
+
         for batch_idx, batch in enumerate(tqdm(self.train_loader, desc="Training", leave=False)):
             self.global_step = epoch * num_batches + batch_idx
             losses = self.train_on_batch(batch)
             train_losses.append(losses['total_loss'])
 
-            # Log training loss after each batch
+            # Log training loss sau mỗi batch
             self.writer.add_scalar('Training/Loss/Total', losses['total_loss'], self.global_step)
+
+            # Kiểm tra xem có cần thực hiện đánh giá không
+            if (batch_idx + 1) % interval == 0:
+                is_final = (batch_idx + 1) == num_batches
+                print(f"\nPerforming validation at batch {batch_idx + 1}/{num_batches} of epoch {epoch + 1}")
+                self.validate(is_final=is_final)
 
         avg_train_loss = np.mean(train_losses)
         print(f"\nAverage Training Loss: {avg_train_loss:.4f}")
 
-        # Validation after each epoch
-        self.validate()
+        # Đánh giá sau khi hoàn thành toàn bộ epoch (nếu chưa đạt 100% các bước đánh giá)
+        if num_batches % interval != 0:
+            self.validate(is_final=True)
+        else:
+            # Nếu đã đánh giá ở cuối epoch, đảm bảo cập nhật scheduler và Early Stopping
+            pass
 
     def train(self):
         """
@@ -297,6 +346,7 @@ class BaseTrainer:
         self.model.load_state_dict(torch.load(filename, map_location=self.device))
         print(f"Model checkpoint loaded from {filename}")
 
+# train.py
 
 def main():
     # Thiết lập thiết bị
@@ -305,14 +355,6 @@ def main():
 
     # Khởi tạo mô hình
     model = CombinedDepthModel()
-
-    # Thiết lập Data Augmentation và Transforms
-    transform = transforms.Compose([
-        transforms.Resize((256, 512)),  # Điều chỉnh kích thước theo nhu cầu
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],  # Nếu sử dụng backbone pre-trained trên ImageNet
-                             std=[0.229, 0.224, 0.225]),
-    ])
 
     # Thiết lập kích thước batch
     batch_size = 4  # Điều chỉnh tùy theo hệ thống của bạn
@@ -337,12 +379,13 @@ def main():
         pin_memory=True
     )
 
-    # Khởi tạo trainer với train_loader và test_loader
+    # Khởi tạo trainer với train_loader và test_loader, thêm tham số validation_interval
     trainer = BaseTrainer(
         model=model,
         train_loader=train_loader,
         test_loader=test_loader,
-        device=device
+        device=device,
+        validation_interval=0.25  # Thực hiện đánh giá cứ mỗi 25% một epoch
     )
     print(model)
     # Bắt đầu huấn luyện
