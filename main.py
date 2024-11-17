@@ -51,8 +51,8 @@ class BaseTrainer:
         self.optimizer = self._init_optimizer(initial_lr, fine_tune_lr, weight_decay)
         self.scheduler = self._init_scheduler()
 
-        # Sử dụng hàm loss tổng hợp từ loss.py
-        self.criterion = DepthLoss(alpha=1.0, beta=1.0, gamma=1.0, delta=1.0)
+        # Sử dụng hàm loss tổng hợp từ loss.py và di chuyển nó sang thiết bị đúng
+        self.criterion = DepthLoss(alpha=1.0, beta=1.0, gamma=1.0, delta=1.0).to(self.device)
 
         self.best_val_loss = float('inf')
         self.epochs_no_improve = 0
@@ -344,7 +344,7 @@ def main():
         test_loader=test_loader,
         device=device
     )
-
+    print(model)
     # Bắt đầu huấn luyện
     trainer.train()
 
