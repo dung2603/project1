@@ -12,8 +12,28 @@ import torch.nn.functional as F
 
 from model.model import CombinedDepthModel
 from dataloader import DataLoadPreprocess
-from evaluation import compute_all_metrics, mask_depth
-from loss import CombinedLoss, SmoothnessLoss
+from evaluation import compute_metrics  # Updated import
+# Đã loại bỏ các import không cần thiết cho loss tùy chỉnh
+# from loss import CombinedLoss, SmoothnessLoss
+
+from torchvision import transforms
+from torch.utils.tensorboard import SummaryWriter
+
+
+def compute_smoothness_loss(depth_map):
+    """
+    Compute smoothness loss by penalizing large gradients in the depth map.
+
+    Args:
+        depth_map (torch.Tensor): Predicted depth map of shape (B, 1, H, W)
+
+    Returns:
+        torch.Tensor: Smoothness loss
+    """
+    grad_x = torch.abs(depth_map[:, :, :, :-1] - depth_map[:, :, :, 1:])
+    grad_y = torch.abs(depth_map[:, :, :-1, :] - depth_map[:, :, 1:, :])
+    smoothness_loss = torch.mean(grad_x) + torch.mean(grad_y)
+    return smoothness_loss
 
 
 class BaseTrainer:
@@ -28,32 +48,12 @@ class BaseTrainer:
         max_depth=10.0,
         smoothness_loss_weight=0.1,
         early_stopping_patience=10,
-        alpha=0.5,
-        beta=0.1,
-        initial_lr=1e-4,
-        fine_tune_lr=1e-5,
+        initial_lr=1e-6,  # Giảm từ 1e-5 xuống 1e-6
+        fine_tune_lr=1e-7,  # Giảm từ 1e-6 xuống 1e-7
         weight_decay=1e-4,
         max_grad_norm=1.0
     ):
-        """
-        Khởi tạo lớp BaseTrainer với mô hình, DataLoader huấn luyện và đánh giá.
-
-        :param model: Mô hình PyTorch được huấn luyện.
-        :param train_loader: DataLoader cho tập huấn luyện.
-        :param test_loader: DataLoader cho tập đánh giá.
-        :param device: Thiết bị để huấn luyện (CPU hoặc GPU).
-        :param num_epochs: Số epoch để huấn luyện.
-        :param min_depth: Độ sâu tối thiểu.
-        :param max_depth: Độ sâu tối đa.
-        :param smoothness_loss_weight: Trọng số cho SmoothnessLoss.
-        :param early_stopping_patience: Số epoch không cải thiện để dừng sớm.
-        :param alpha: Trọng số alpha cho CombinedLoss.
-        :param beta: Trọng số beta cho CombinedLoss.
-        :param initial_lr: Learning rate cho các tham số cần fine-tune.
-        :param fine_tune_lr: Learning rate cho các tham số không cần fine-tune.
-        :param weight_decay: Hệ số weight decay cho optimizer.
-        :param max_grad_norm: Giới hạn norm của gradient để clip.
-        """
+        
         self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model = model.to(self.device)
         self.train_loader = train_loader
@@ -67,12 +67,21 @@ class BaseTrainer:
 
         self.optimizer = self._init_optimizer(initial_lr, fine_tune_lr, weight_decay)
         self.scheduler = self._init_scheduler()
-        self.criterion = CombinedLoss(alpha=alpha, beta=beta)
-        self.smoothness_criterion = SmoothnessLoss()
-        self.scaler = torch.cuda.amp.GradScaler()
+
+        # Thay thế CombinedLoss bằng hàm mất mát tiêu chuẩn
+        self.criterion = nn.MSELoss()  # Bạn có thể thử nn.L1Loss() hoặc nn.SmoothL1Loss()
+
+        # Không sử dụng smoothness_criterion vì chúng ta đã định nghĩa compute_smoothness_loss
+        # self.smoothness_criterion = nn.L1Loss()  # Hoặc nn.MSELoss()
+
+        # Tắt GradScaler để không sử dụng mixed precision
+        self.scaler = None
 
         self.best_val_loss = float('inf')
         self.epochs_no_improve = 0
+
+        # Thiết lập TensorBoard
+        self.writer = SummaryWriter('runs/depth_estimation_experiment')
 
     def _init_optimizer(self, initial_lr, fine_tune_lr, weight_decay):
         """
@@ -82,7 +91,7 @@ class BaseTrainer:
         frozen_params = [param for param in self.model.parameters() if not param.requires_grad]
 
         if not fine_tune_params:
-            print("Không có tham số nào yêu cầu gradient. Tất cả tham số sẽ được cập nhật với lr=1e-5.")
+            print("Không có tham số nào yêu cầu gradient. Tất cả tham số sẽ được cập nhật với lr=1e-7.")
             optimizer = optim.AdamW(frozen_params, lr=fine_tune_lr, weight_decay=weight_decay)
         else:
             optimizer = optim.AdamW([
@@ -96,7 +105,8 @@ class BaseTrainer:
         """
         Khởi tạo trình điều phối học (learning rate scheduler).
         """
-        return optim.lr_scheduler.StepLR(self.optimizer, step_size=5, gamma=0.1)
+        # Sử dụng ReduceLROnPlateau để giảm learning rate khi mất mát validation không giảm
+        return optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=0.1, patience=5, verbose=True)
 
     def _process_batch(self, batch, training=True):
         """
@@ -117,30 +127,70 @@ class BaseTrainer:
         if masks is not None and masks.dim() == 3:
             masks = masks.unsqueeze(1)
 
+        # Kiểm tra NaN trong images và depths
+        if torch.isnan(images).any():
+            print("Warning: Images contain NaN values.")
+        if torch.isnan(depths).any():
+            print("Warning: Depths contain NaN values.")
+
+        # In thông tin về dữ liệu đầu vào
+        print(f"Images - min: {images.min().item()}, max: {images.max().item()}, mean: {images.mean().item()}")
+        print(f"Depths - min: {depths.min().item()}, max: {depths.max().item()}, mean: {depths.mean().item()}")
+
         if training:
             self.model.train()
             self.optimizer.zero_grad()
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast('cuda', enabled=False):  # Tắt autocast
                 depth_map = self.model(images)
+                
+                # Kiểm tra NaN trong depth_map sau khi dự đoán
+                if torch.isnan(depth_map).any():
+                    print("Warning: Predicted depth_map contains NaN values.")
+
                 depth_map = self._resize_depth_map(depth_map, depths)
 
-                mask = mask_depth(target=depths, min_depth=self.min_depth, max_depth=self.max_depth)
+                # Apply mask for valid depth values
+                mask = self._mask_depth(depths)
                 if mask is not None:
                     depth_map = depth_map * mask
                     depths = depths * mask
 
-                loss_depth_ssim = self.criterion(depth_map, depths)
-                loss_smoothness = self.smoothness_criterion(depth_map)
-                total_loss = loss_depth_ssim + self.smoothness_loss_weight * loss_smoothness
+                # Kiểm tra NaN trước khi tính loss
+                if torch.isnan(depth_map).any() or torch.isnan(depths).any():
+                    print("Warning: depth_map or depths contain NaN values before loss calculation.")
 
-            self.scaler.scale(total_loss).backward()
-            self.scaler.unscale_(self.optimizer)
+                # Sử dụng hàm mất mát tiêu chuẩn
+                loss_depth = self.criterion(depth_map, depths)
+                loss_smoothness = compute_smoothness_loss(depth_map)
+                total_loss = loss_depth + self.smoothness_loss_weight * loss_smoothness
+
+                # In ra giá trị loss để debug
+                print(f"Training - loss_depth: {loss_depth.item()}, loss_smoothness: {loss_smoothness.item()}, total_loss: {total_loss.item()}")
+
+            # Kiểm tra NaN trong total_loss
+            if torch.isnan(total_loss):
+                print("Warning: total_loss is NaN.")
+                # Bạn có thể lựa chọn dừng huấn luyện hoặc tiếp tục tùy thuộc vào nhu cầu
+                # raise ValueError("Total loss is NaN.")
+
+            total_loss.backward()
+
+            # Kiểm tra NaN trong gradients
+            for name, param in self.model.named_parameters():
+                if param.grad is not None:
+                    if torch.isnan(param.grad).any():
+                        print(f"Warning: Gradient of {name} contains NaN.")
+
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.max_grad_norm)
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
+            self.optimizer.step()
+
+            # Log loss to TensorBoard
+            self.writer.add_scalar('Loss/Depth', loss_depth.item(), self.global_step)
+            self.writer.add_scalar('Loss/Smoothness', loss_smoothness.item(), self.global_step)
+            self.writer.add_scalar('Loss/Total', total_loss.item(), self.global_step)
 
             loss_dict = {
-                'depth_loss_ssim': loss_depth_ssim.item(),
+                'depth_loss': loss_depth.item(),
                 'smoothness_loss': loss_smoothness.item(),
                 'total_loss': total_loss.item()
             }
@@ -150,25 +200,52 @@ class BaseTrainer:
             self.model.eval()
             with torch.no_grad():
                 depth_map = self.model(images)
+                
+                # Kiểm tra NaN trong depth_map sau khi dự đoán
+                if torch.isnan(depth_map).any():
+                    print("Warning: Predicted depth_map contains NaN values.")
+
                 depth_map = self._resize_depth_map(depth_map, depths)
 
-                mask = mask_depth(target=depths, min_depth=self.min_depth, max_depth=self.max_depth)
+                # Apply mask for valid depth values
+                mask = self._mask_depth(depths)
                 if mask is not None:
                     depth_map = depth_map * mask
                     depths = depths * mask
 
-                loss_depth_ssim = self.criterion(depth_map, depths)
-                loss_smoothness = self.smoothness_criterion(depth_map)
-                total_loss = loss_depth_ssim + self.smoothness_loss_weight * loss_smoothness
+                # Kiểm tra NaN trước khi tính loss
+                if torch.isnan(depth_map).any() or torch.isnan(depths).any():
+                    print("Warning: depth_map or depths contain NaN values before loss calculation.")
 
-                metrics = compute_all_metrics(depth_map, depths, mask=mask)
+                # Sử dụng hàm mất mát tiêu chuẩn
+                loss_depth = self.criterion(depth_map, depths)
+                loss_smoothness = compute_smoothness_loss(depth_map)
+                total_loss = loss_depth + self.smoothness_loss_weight * loss_smoothness
+
+                # In ra giá trị loss để debug
+                print(f"Validation - loss_depth: {loss_depth.item()}, loss_smoothness: {loss_smoothness.item()}, total_loss: {total_loss.item()}")
+
+                # Compute metrics using compute_metrics from metric.py
+                metrics = compute_metrics(depth_map, depths, mask=mask)
 
                 loss_dict = {
-                    'depth_loss_ssim': loss_depth_ssim.item(),
+                    'depth_loss': loss_depth.item(),
                     'smoothness_loss': loss_smoothness.item(),
                     'total_loss': total_loss.item()
                 }
                 loss_dict.update(metrics)
+
+                # Kiểm tra các giá trị metric có NaN không
+                for k, v in metrics.items():
+                    if np.isnan(v):
+                        print(f"Warning: Metric {k} is NaN.")
+
+                # Log validation loss and metrics to TensorBoard
+                self.writer.add_scalar('Validation/Loss/Depth', loss_depth.item(), self.global_step)
+                self.writer.add_scalar('Validation/Loss/Smoothness', loss_smoothness.item(), self.global_step)
+                self.writer.add_scalar('Validation/Loss/Total', total_loss.item(), self.global_step)
+                for metric_name, metric_value in metrics.items():
+                    self.writer.add_scalar(f'Validation/Metrics/{metric_name}', metric_value, self.global_step)
 
                 return loss_dict
 
@@ -188,6 +265,19 @@ class BaseTrainer:
                 align_corners=True
             )
         return depth_map
+
+    def _mask_depth(self, target):
+        """
+        Tạo mask cho các giá trị độ sâu hợp lệ.
+
+        :param target: Bản đồ độ sâu thực tế.
+        :return: Mask với giá trị 1 cho các điểm hợp lệ và 0 cho các điểm không hợp lệ.
+        """
+        mask = (target > self.min_depth) & (target < self.max_depth)
+        # Thêm kiểm tra tỷ lệ hợp lệ
+        valid_ratio = mask.float().mean().item()
+        print(f"Valid depth ratio: {valid_ratio:.4f}")
+        return mask.float()
 
     def train_on_batch(self, batch):
         """
@@ -234,6 +324,24 @@ class BaseTrainer:
             for k, v in avg_metrics.items():
                 print(f"  {k}: {v:.4f}")
 
+            # Log validation metrics to TensorBoard
+            for metric_name, metric_value in avg_metrics.items():
+                self.writer.add_scalar(f'Validation/Averages/{metric_name}', metric_value, self.global_step)
+
+        # Update scheduler based on validation loss
+        self.scheduler.step(avg_val_loss)
+
+        # Early Stopping
+        if avg_val_loss < self.best_val_loss:
+            self.best_val_loss = avg_val_loss
+            self.epochs_no_improve = 0
+            self.save_checkpoint('best_model.pth')
+        else:
+            self.epochs_no_improve += 1
+            if self.epochs_no_improve >= self.early_stopping_patience:
+                print(f"Early stopping triggered after {self.epochs_no_improve} epochs with no improvement.")
+                raise StopIteration
+
     def train_epoch(self, epoch):
         """
         Huấn luyện mô hình trong một epoch.
@@ -253,8 +361,12 @@ class BaseTrainer:
         current_val_step = 0
 
         for batch_idx, batch in enumerate(tqdm(self.train_loader, desc="Training", leave=False)):
+            self.global_step = epoch * num_batches + batch_idx
             losses = self.train_on_batch(batch)
             train_losses.append(losses['total_loss'])
+
+            # Log training loss after each batch
+            self.writer.add_scalar('Training/Loss/Total', losses['total_loss'], self.global_step)
 
             if (batch_idx + 1) == validation_steps[current_val_step]:
                 print(f"\nValidation after {int((current_val_step + 1) * 25)}% of the epoch")
@@ -268,19 +380,6 @@ class BaseTrainer:
         print("\nValidation after complete epoch")
         self.validate()
 
-        self.scheduler.step()
-
-        # Early Stopping
-        if avg_train_loss < self.best_val_loss:
-            self.best_val_loss = avg_train_loss
-            self.epochs_no_improve = 0
-            self.save_checkpoint('best_model.pth')
-        else:
-            self.epochs_no_improve += 1
-            if self.epochs_no_improve >= self.early_stopping_patience:
-                print(f"Early stopping triggered after {self.epochs_no_improve} epochs with no improvement.")
-                raise StopIteration
-
     def train(self):
         """
         Thực hiện huấn luyện mô hình trên toàn bộ epoch.
@@ -291,6 +390,9 @@ class BaseTrainer:
                 self.train_epoch(epoch)
         except StopIteration:
             print("Dừng huấn luyện sớm do không cải thiện.")
+
+        # Close TensorBoard writer
+        self.writer.close()
 
     def evaluate_model(self):
         """
@@ -326,8 +428,17 @@ class BaseTrainer:
 
         :param filename: Tên tệp để lưu trọng số.
         """
-        torch.save(self.model.state_dict(), filename)
-        print(f"Model checkpoint saved to {filename}")
+        # Kiểm tra NaN trong trọng số mô hình trước khi lưu
+        has_nan = False
+        for name, param in self.model.named_parameters():
+            if torch.isnan(param).any():
+                print(f"Warning: Parameter {name} contains NaN values.")
+                has_nan = True
+        if not has_nan:
+            torch.save(self.model.state_dict(), filename)
+            print(f"Model checkpoint saved to {filename}")
+        else:
+            print("Checkpoint not saved due to NaN values in model parameters.")
 
     def load_checkpoint(self, filename):
         """
@@ -347,16 +458,32 @@ def main():
     # Khởi tạo mô hình
     model = CombinedDepthModel()
 
+    # Kiểm tra NaN trong trọng số mô hình ngay sau khi khởi tạo
+    for name, param in model.named_parameters():
+        if torch.isnan(param).any():
+            print(f"Warning: Parameter {name} contains NaN values at initialization.")
+
     # **Mở khóa các tham số cần thiết**
     # Ví dụ: Mở khóa các lớp của Segmentation Backbone
     # model.unfreeze_backbone_layers(layers_to_unfreeze=['layer4', 'block'])
 
+    # Thiết lập Data Augmentation và Transforms
+    transform = transforms.Compose([
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomRotation(10),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+        transforms.Resize((256, 512)),  # Ví dụ kích thước, điều chỉnh theo nhu cầu
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],  # Nếu sử dụng backbone pre-trained trên ImageNet
+                             std=[0.229, 0.224, 0.225]),
+    ])
+
     # Thiết lập kích thước batch
-    batch_size = 2  # Điều chỉnh tùy theo hệ thống của bạn
+    batch_size = 4  # Điều chỉnh tùy theo hệ thống của bạn
 
     # Tải và tạo DataLoaders
-    train_dataset = DataLoadPreprocess(mode='train')
-    test_dataset = DataLoadPreprocess(mode='test')
+    train_dataset = DataLoadPreprocess(mode='train', transform=transform)
+    test_dataset = DataLoadPreprocess(mode='test', transform=transform)
 
     train_loader = DataLoader(
         train_dataset,
@@ -373,6 +500,17 @@ def main():
         num_workers=4,  # Điều chỉnh số worker tùy theo hệ thống
         pin_memory=True
     )
+
+    # Kiểm tra dữ liệu đầu vào trước khi huấn luyện
+    sample_batch = next(iter(train_loader))
+    images_sample = sample_batch['image'].to(device)
+    depths_sample = sample_batch['depth'].to(device)
+    masks_sample = sample_batch.get('mask', None)
+    if masks_sample is not None:
+        masks_sample = masks_sample.to(device)
+
+    print(f"Sample Images - min: {images_sample.min().item()}, max: {images_sample.max().item()}, mean: {images_sample.mean().item()}")
+    print(f"Sample Depths - min: {depths_sample.min().item()}, max: {depths_sample.max().item()}, mean: {depths_sample.mean().item()}")
 
     # Khởi tạo trainer với train_loader và test_loader
     trainer = BaseTrainer(
