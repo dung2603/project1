@@ -42,12 +42,13 @@ class SSIMLoss(nn.Module):
     """
     SSIM Loss cho ước lượng độ sâu.
     """
-    def __init__(self, window_size=11, size_average=True):
+    def __init__(self, window_size=11, size_average=True, channel=1):
         super(SSIMLoss, self).__init__()
         self.window_size = window_size
         self.size_average = size_average
-        self.channel = 1
-        self.window = self.create_window(window_size, self.channel)
+        self.channel = channel
+        window = self.create_window(window_size, self.channel)
+        self.register_buffer('window', window)  # Đăng ký window như một buffer
 
     def gaussian_window(self, window_size, sigma):
         gauss = torch.Tensor([
