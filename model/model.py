@@ -1,209 +1,212 @@
-# model.py
-
-import torch
+import torch 
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.models.segmentation import deeplabv3_resnet50
 import torch.hub
 from typing import List
 
-# Import các thành phần cần thiết từ DPT
-from .dpt import _make_encoder, _make_fusion_block, forward_vit, Interpolate
+# Đảm bảo rằng bạn đã import UNet và các thành phần của nó
+from .unet_parts import DoubleConv, Down, Up, OutConv
+from .unet_model import UNet
 
+class SimpleFusionBlock(nn.Module):
+    """
+    A simple fusion block that combines features from different sources
+    using convolutional layers without channel attention.
+    """
+
+    def __init__(self, in_channels: int, out_channels: int):
+        """
+        Initializes the SimpleFusionBlock.
+
+        Args:
+            in_channels (int): Number of input channels.
+            out_channels (int): Number of output channels.
+        """
+        super(SimpleFusionBlock, self).__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass of the fusion block.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (B, in_channels, H, W).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (B, out_channels, H, W).
+        """
+        return self.conv(x)
+
+class UNetDecoder(nn.Module):
+    """
+    UNet-based decoder for processing fused features.
+    """
+    def __init__(self, in_channels, out_channels, bilinear=False):
+        super(UNetDecoder, self).__init__()
+        self.unet = UNet(n_channels=in_channels, n_classes=out_channels, bilinear=bilinear)
+
+    def forward(self, x):
+        return self.unet(x)
 
 class CombinedDepthModel(nn.Module):
     """
-    Mô hình kết hợp ZoeDepth và DeepLabV3 với bộ giải mã DPT.
+    Combined model that integrates ZoeDepth for depth estimation and
+    DeepLabV3 for semantic segmentation to produce an enhanced depth map.
+    Utilizes UNet as the decoder after feature fusion.
     """
 
     def __init__(
         self,
         zoe_repo: str = "isl-org/ZoeDepth",
         zoe_model_name: str = "ZoeD_N",
-        backbone: str = "vitb_rn50_384",
-        features: int = 256,
-        readout: str = "project",
-        use_bn: bool = True,
+        fusion_out_channels: int = 128,
+        unet_bilinear: bool = False
     ):
-        super().__init__()
+        """
+        Initializes the CombinedDepthModel.
 
-        # Tải mô hình ZoeDepth đã được huấn luyện trước
+        Args:
+            zoe_repo (str): Repository name for ZoeDepth on torch.hub.
+            zoe_model_name (str): Model name for ZoeDepth.
+            fusion_out_channels (int): Number of output channels for fusion block.
+            unet_bilinear (bool): Whether to use bilinear upsampling in UNet.
+        """
+        super(CombinedDepthModel, self).__init__()
+
+        # Load ZoeDepth pre-trained model
         self.model_zoe = torch.hub.load(zoe_repo, zoe_model_name, pretrained=True)
 
-        # Tải backbone của DeepLabV3 cho phân đoạn ảnh
+        # Load DeepLabV3 model for semantic segmentation with ResNet-50 backbone
         segmentation_model = deeplabv3_resnet50(pretrained=True)
         self.segmentation_backbone = segmentation_model.backbone
 
-        # Khởi tạo encoder và decoder của DPT
-        self.pretrained, self.scratch = _make_encoder(
-            backbone=backbone,
-            features=features,
-            use_pretrained=False,  # Sửa tham số thành 'use_pretrained' cho phù hợp với hàm _make_encoder
-            groups=1,
-            expand=False,
-            exportable=False,
-            hooks=None,
-            use_readout=readout,
-            enable_attention_hooks=False,
-        )
+        # Define channel dimensions
+        seg_channels = 2048  # Output channels from ResNet-50 backbone
+        zoe_channels = 1      # ZoeDepth outputs a single depth channel
+        combined_channels = seg_channels + zoe_channels  # Total combined channels
 
-        self.scratch.refinenet1 = _make_fusion_block(features, use_bn)
-        self.scratch.refinenet2 = _make_fusion_block(features, use_bn)
-        self.scratch.refinenet3 = _make_fusion_block(features, use_bn)
-        self.scratch.refinenet4 = _make_fusion_block(features, use_bn)
+        # Define fusion block
+        self.fusion_block = SimpleFusionBlock(combined_channels, fusion_out_channels)
 
-        # Định nghĩa output head như trong DPTDepthModel
-        self.scratch.output_conv = nn.Sequential(
-            nn.Conv2d(features, features // 2, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            Interpolate(scale_factor=2, mode="bilinear", align_corners=True),
-            nn.Conv2d(features // 2, 32, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(32, 1, kernel_size=1),
-            nn.ReLU(inplace=True),
-        )
+        # Define UNet decoder
+        self.unet_decoder = UNetDecoder(in_channels=fusion_out_channels, out_channels=1, bilinear=unet_bilinear)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Tiến hành truyền xuôi để tính toán bản đồ độ sâu.
+        Forward pass to compute the depth map.
 
         Args:
-            x (torch.Tensor): Ảnh đầu vào dạng tensor với kích thước (B, 3, H, W).
+            x (torch.Tensor): Input image tensor of shape (B, 3, H, W).
 
         Returns:
-            torch.Tensor: Bản đồ độ sâu dự đoán với kích thước (B, 1, H, W).
+            torch.Tensor: Predicted depth map of shape (B, 1, H, W).
         """
-        # Trích xuất đặc trưng độ sâu từ ZoeDepth
-        features_zoe = self._extract_depth_features(x)  # (B, 1, H, W)
+        # Extract depth features from ZoeDepth
+        features_zoe = self._extract_depth_features(x)  # Expected shape: (B, 1, H, W)
 
-        # Trích xuất đặc trưng phân đoạn từ backbone của DeepLabV3
-        features_seg = self._extract_segmentation_features(x)  # (B, 2048, H/8, W/8)
+        # Extract segmentation features from DeepLabV3 backbone
+        features_seg = self._extract_segmentation_features(x)  # Shape: (B, 2048, H/8, W/8)
 
-        # Thay đổi kích thước đặc trưng phân đoạn để khớp với đặc trưng độ sâu
+        # Resize segmentation features to match depth feature spatial dimensions
         features_seg_resized = self._resize_features(features_seg, features_zoe.shape[2:])  # (B, 2048, H, W)
 
-        # Kết hợp đặc trưng từ ZoeDepth và phân đoạn
-        combined_features = torch.cat((features_zoe, features_seg_resized), dim=1)  # (B, C, H, W)
+        # Combine depth and segmentation features
+        combined_features = torch.cat((features_zoe, features_seg_resized), dim=1)  # Shape: (B, 2049, H, W)
 
-        # Điều chỉnh số kênh để phù hợp với input của encoder DPT (3 kênh)
-        combined_features = self._adapt_channels(combined_features, target_channels=3)
+        # Fuse combined features
+        fused_features = self.fusion_block(combined_features)  # Shape: (B, fusion_out_channels, H, W)
 
-        # Truyền qua encoder của DPT
-        layer_1, layer_2, layer_3, layer_4 = forward_vit(self.pretrained, combined_features)
-
-        # Xử lý các layer qua decoder của DPT
-        layer_1_rn = self.scratch.layer1_rn(layer_1)
-        layer_2_rn = self.scratch.layer2_rn(layer_2)
-        layer_3_rn = self.scratch.layer3_rn(layer_3)
-        layer_4_rn = self.scratch.layer4_rn(layer_4)
-
-        path_4 = self.scratch.refinenet4(layer_4_rn)
-        path_3 = self.scratch.refinenet3(path_4, layer_3_rn)
-        path_2 = self.scratch.refinenet2(path_3, layer_2_rn)
-        path_1 = self.scratch.refinenet1(path_2, layer_1_rn)
-
-        # Tính toán bản đồ độ sâu đầu ra
-        depth_map = self.scratch.output_conv(path_1)  # (B, 1, H, W)
+        # Pass fused features through UNet decoder to get depth map
+        depth_map = self.unet_decoder(fused_features)  # Shape: (B, 1, H, W)
 
         return depth_map
 
-    def _adapt_channels(self, x: torch.Tensor, target_channels: int) -> torch.Tensor:
-        """
-        Điều chỉnh số kênh của tensor x thành target_channels.
-
-        Args:
-            x (torch.Tensor): Tensor đầu vào.
-            target_channels (int): Số kênh mong muốn.
-
-        Returns:
-            torch.Tensor: Tensor với số kênh đã được điều chỉnh.
-        """
-        current_channels = x.shape[1]
-        if current_channels > target_channels:
-            x = x[:, :target_channels, :, :]
-        elif current_channels < target_channels:
-            pad = target_channels - current_channels
-            padding = torch.zeros(
-                x.shape[0], pad, x.shape[2], x.shape[3], device=x.device
-            )
-            x = torch.cat([x, padding], dim=1)
-        return x
-
     def _extract_depth_features(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Trích xuất đặc trưng độ sâu sử dụng mô hình ZoeDepth.
+        Extracts depth features using ZoeDepth model.
 
         Args:
-            x (torch.Tensor): Ảnh đầu vào.
+            x (torch.Tensor): Input image tensor of shape (B, 3, H, W).
 
         Returns:
-            torch.Tensor: Đặc trưng độ sâu.
+            torch.Tensor: Depth features tensor of shape (B, 1, H, W).
         """
-        features_zoe = self.model_zoe.infer(x)  # (B, 1, H, W)
+        features_zoe = self.model_zoe.infer(x)  # Expected shape: (B, 1, H, W)
+
         if features_zoe.dim() == 3:
-            features_zoe = features_zoe.unsqueeze(1)
+            features_zoe = features_zoe.unsqueeze(1)  # Ensure shape: (B, 1, H, W)
+        elif features_zoe.dim() != 4 or features_zoe.size(1) != 1:
+            raise ValueError(f"Unexpected shape for features_zoe: {features_zoe.shape}")
+
         return features_zoe
 
     def _extract_segmentation_features(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Trích xuất đặc trưng phân đoạn sử dụng backbone của DeepLabV3.
+        Extracts segmentation features using DeepLabV3 backbone.
 
         Args:
-            x (torch.Tensor): Ảnh đầu vào.
+            x (torch.Tensor): Input image tensor of shape (B, 3, H, W).
 
         Returns:
-            torch.Tensor: Đặc trưng phân đoạn.
+            torch.Tensor: Segmentation features tensor of shape (B, 2048, H/8, W/8).
         """
-        features_seg = self.segmentation_backbone(x)['out']  # (B, 2048, H/8, W/8)
+        features_seg = self.segmentation_backbone(x)['out']  # Shape: (B, 2048, H/8, W/8)
         return features_seg
 
     def _resize_features(self, features: torch.Tensor, target_size: tuple) -> torch.Tensor:
         """
-        Thay đổi kích thước đặc trưng để khớp với kích thước không gian mục tiêu.
+        Resizes features to match the target spatial dimensions.
 
         Args:
-            features (torch.Tensor): Đặc trưng cần thay đổi kích thước.
-            target_size (tuple): Kích thước không gian mục tiêu (H, W).
+            features (torch.Tensor): Features tensor to be resized.
+            target_size (tuple): Target spatial size (H, W).
 
         Returns:
-            torch.Tensor: Đặc trưng đã được thay đổi kích thước.
+            torch.Tensor: Resized features tensor.
         """
-        return F.interpolate(features, size=target_size, mode='bilinear', align_corners=False)
+        if features.shape[2:] != target_size:
+            features = F.interpolate(
+                features,
+                size=target_size,
+                mode='bilinear',
+                align_corners=False
+            )
+        return features
 
     def unfreeze_backbone_layers(self, layers_to_unfreeze: List[str]) -> None:
         """
-        Mở khóa các lớp cụ thể của mạng backbone để fine-tune.
+        Unfreeze specific layers of the backbone networks for fine-tuning.
 
         Args:
-            layers_to_unfreeze (List[str]): Danh sách tên các lớp cần mở khóa.
+            layers_to_unfreeze (List[str]): List of layer names to unfreeze.
         """
         for name, param in self.segmentation_backbone.named_parameters():
             if any(layer in name for layer in layers_to_unfreeze):
                 param.requires_grad = True
 
         for name, param in self.model_zoe.named_parameters():
-            if any(layer in name for layer in layers_to_unfreeze):
-                param.requires_grad = True
-
-        for name, param in self.pretrained.named_parameters():
             if any(layer in name for layer in layers_to_unfreeze):
                 param.requires_grad = True
 
     def freeze_backbone_layers(self, layers_to_freeze: List[str]) -> None:
         """
-        Đóng băng các lớp cụ thể của mạng backbone để ngăn chúng được cập nhật trong quá trình huấn luyện.
+        Freeze specific layers of the backbone networks to prevent them from being updated during training.
 
         Args:
-            layers_to_freeze (List[str]): Danh sách tên các lớp cần đóng băng.
+            layers_to_freeze (List[str]): List of layer names to freeze.
         """
         for name, param in self.segmentation_backbone.named_parameters():
             if any(layer in name for layer in layers_to_freeze):
                 param.requires_grad = False
 
         for name, param in self.model_zoe.named_parameters():
-            if any(layer in name for layer in layers_to_freeze):
-                param.requires_grad = False
-
-        for name, param in self.pretrained.named_parameters():
             if any(layer in name for layer in layers_to_freeze):
                 param.requires_grad = False
