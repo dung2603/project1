@@ -5,7 +5,6 @@ from torchvision.models.segmentation import deeplabv3_resnet50
 import torch.hub
 from typing import List
 
-# Đảm bảo rằng bạn đã import UNet và các thành phần của nó
 from .unet_parts import DoubleConv, Down, Up, OutConv
 from .unet_model import UNet
 
