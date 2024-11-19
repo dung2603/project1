@@ -8,7 +8,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
 
-from model import CombinedDepthModel
+from model.model import CombinedDepthModel
 from dataloader import DataLoadPreprocess
 from evaluation import compute_metrics
 from loss import DepthLoss
