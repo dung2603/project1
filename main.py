@@ -1,3 +1,5 @@
+# trainer.py
+
 import os
 import numpy as np
 from tqdm import tqdm
@@ -7,14 +9,13 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
 
-from model.model import CombinedDepthModel
+from model import CombinedDepthModel
 from dataloader import DataLoadPreprocess
 from evaluation import compute_metrics
-from loss import DepthLoss
+from loss import ScaleInvariantLoss
 
 from torchvision import transforms
 from torch.utils.tensorboard import SummaryWriter
-
 
 class BaseTrainer:
     def __init__(
@@ -23,14 +24,13 @@ class BaseTrainer:
         train_loader,
         test_loader,
         device=None,
-        num_epochs=50,
+        num_epochs=100,
         min_depth=0.1,
         max_depth=10.0,
-        early_stopping_patience=10,
-        initial_lr=1e-5,
-        weight_decay=1e-4,
+        early_stopping_patience=15,
+        initial_lr=1e-4,
         max_grad_norm=1.0,
-        validation_interval=0.25
+        validation_interval=0.5
     ):
         self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model = model.to(self.device)
@@ -43,9 +43,9 @@ class BaseTrainer:
         self.max_grad_norm = max_grad_norm
         self.validation_interval = validation_interval
 
-        self.optimizer = optim.AdamW(self.model.parameters(), lr=initial_lr, weight_decay=weight_decay)
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=0.1, patience=5, verbose=True)
-        self.criterion = DepthLoss(alpha=1.0, beta=0.1, delta=0.1).to(self.device)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=initial_lr)
+        self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=20, gamma=0.5)
+        self.criterion = ScaleInvariantLoss().to(self.device)
 
         self.best_val_loss = float('inf')
         self.epochs_no_improve = 0
@@ -63,27 +63,28 @@ class BaseTrainer:
         if masks is not None and masks.dim() == 3:
             masks = masks.unsqueeze(1)
 
-        self.model.train() if training else self.model.eval()
+        if training:
+            self.model.train()
+        else:
+            self.model.eval()
+
         with torch.set_grad_enabled(training):
             depth_map = self.model(images)
             epsilon = 1e-6
-            depth_map = F.softplus(depth_map) + epsilon
+            depth_map = depth_map + epsilon
+
             depth_map = self._resize_depth_map(depth_map, depths)
 
             mask = self._mask_depth(depths)
-            if mask is not None:
-                depth_map = depth_map * mask
-                depths = depths * mask
+            if masks is not None:
+                mask = mask * masks 
 
-            valid_depth_values = depth_map[mask > 0] if mask is not None else depth_map
-            if (valid_depth_values <= 0).any():
-                print("Non-positive values detected in valid depth regions")
-                return {'total_loss': float('nan')}
+            # Áp dụng mask
+            depth_map = depth_map * mask
+            depths = depths * mask
 
+            # Tính loss
             total_loss = self.criterion(depth_map, depths)
-            if torch.isnan(total_loss).item():
-                print("NaN detected in total_loss")
-                return {'total_loss': float('nan')}
 
             if training:
                 self.optimizer.zero_grad()
@@ -146,7 +147,7 @@ class BaseTrainer:
                 self.writer.add_scalar(f'Validation/Averages/{k}', v, self.global_step)
 
         if is_final:
-            self.scheduler.step(avg_val_loss)
+            self.scheduler.step()
             if avg_val_loss < self.best_val_loss:
                 self.best_val_loss = avg_val_loss
                 self.epochs_no_improve = 0
@@ -191,30 +192,29 @@ class BaseTrainer:
         torch.save(self.model.state_dict(), filename)
         print(f"Model checkpoint saved to {filename}")
 
-
 def main():
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     print(f"Using device: {device}")
 
     model = CombinedDepthModel()
     transform = transforms.Compose([
-        transforms.Resize((384, 512)),
+        transforms.Resize((384, 384)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],  # Normalization theo ImageNet
+                             std=[0.229, 0.224, 0.225]),
     ])
 
-    batch_size = 4
+    batch_size = 8  # Tăng batch size nếu GPU của bạn cho phép
     train_dataset = DataLoadPreprocess(mode='train', transform=transform)
     test_dataset = DataLoadPreprocess(mode='test', transform=transform)
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
-    trainer = BaseTrainer(model, train_loader, test_loader, device=device, validation_interval=0.25)
+    trainer = BaseTrainer(model, train_loader, test_loader, device=device, num_epochs=100, early_stopping_patience=15, validation_interval=0.5)
     trainer.train()
     trainer.evaluate_model()
     trainer.save_checkpoint('combined_model.pth')
-
 
 if __name__ == '__main__':
     main()
