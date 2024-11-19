@@ -15,7 +15,6 @@ class AttentionFusionBlock(nn.Module):
         self.bn1 = nn.BatchNorm2d(out_channels)
         self.relu = nn.ReLU(inplace=True)
 
-        # Cơ chế chú ý kênh
         self.global_avg_pool = nn.AdaptiveAvgPool2d(1)
         self.fc1 = nn.Conv2d(out_channels, out_channels // 16, kernel_size=1, bias=False)
         self.bn2 = nn.BatchNorm2d(out_channels // 16)
@@ -30,7 +29,6 @@ class AttentionFusionBlock(nn.Module):
         out = self.bn1(out)
         out = self.relu(out)
 
-        # Áp dụng cơ chế chú ý kênh
         w = self.global_avg_pool(out)
         w = self.fc1(w)
         w = self.bn2(w)
@@ -79,11 +77,6 @@ class CombinedDepthModel(nn.Module):
 
         # Load mô hình ZoeDepth pre-trained
         self.model_zoe = torch.hub.load(zoe_repo, zoe_model_name, pretrained=True)
-        # Giả sử ZoeDepth có thuộc tính backbone
-        if hasattr(self.model_zoe, 'backbone'):
-            self.zoe_backbone = self.model_zoe.backbone
-        else:
-            raise NotImplementedError("ZoeDepth model does not support feature extraction.")
 
         # Load mô hình DeepLabV3 với ResNet-50 backbone
         segmentation_model = deeplabv3_resnet50(pretrained=True)
@@ -92,13 +85,12 @@ class CombinedDepthModel(nn.Module):
         # Áp dụng ASPP
         self.aspp = ASPP(in_channels=2048, out_channels=256)
 
-        # Khối hợp nhất với AttentionFusionBlock
         self.fusion_block = AttentionFusionBlock(
-            in_channels=256 + 1024,
+            in_channels=256 + 1,  # 256 từ ASPP và 1 từ bản đồ độ sâu ZoeDepth
             out_channels=fusion_out_channels
         )
 
-        # Bộ giải mã UNet
+        # UNet
         self.unet_decoder = UNet(
             n_channels=fusion_out_channels,
             n_classes=1,
@@ -106,24 +98,23 @@ class CombinedDepthModel(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        features_zoe = self._extract_depth_features(x)  # (B, 1024, H/4, W/4) 
-        features_seg = self._extract_segmentation_features(x)  # (B, 256, H/4, W/4)
-        combined_features = torch.cat((features_zoe, features_seg), dim=1)
+        with torch.no_grad():
+            depth_zoe = self.model_zoe.infer(x)  # (B, H, W)
+
+        if depth_zoe.dim() == 3:
+            depth_zoe = depth_zoe.unsqueeze(1)  # (B, 1, H, W)
+        features_seg = self._extract_segmentation_features(x)  # (B, 256, H/8, W/8)
+        depth_zoe_resized = F.interpolate(depth_zoe, size=features_seg.shape[2:], mode='bilinear', align_corners=False)
+        combined_features = torch.cat((features_seg, depth_zoe_resized), dim=1)  # (B, 257, H/8, W/8)
         fused_features = self.fusion_block(combined_features)
         depth_map = self.unet_decoder(fused_features)
+
         return depth_map
 
-    def _extract_depth_features(self, x: torch.Tensor) -> torch.Tensor:
-        # Trích xuất đặc trưng từ ZoeDepth backbone
-        features = self.zoe_backbone(x)
-        return features
-
     def _extract_segmentation_features(self, x: torch.Tensor) -> torch.Tensor:
-        features = self.segmentation_backbone(x)['out'] 
+        features = self.segmentation_backbone(x)['out']
         features = self.aspp(features)
-        features = F.interpolate(features, size=(x.shape[2] // 4, x.shape[3] // 4), mode='bilinear', align_corners=False)
         return features
-
     def unfreeze_backbone_layers(self, layers_to_unfreeze: List[str]) -> None:
         
         for name, param in self.segmentation_backbone.named_parameters():
