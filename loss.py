@@ -4,9 +4,6 @@ import torch
 import torch.nn as nn
 
 class SILogLoss(nn.Module):
-    """
-    Scale-Invariant Logarithmic Loss cho ước lượng độ sâu.
-    """
     def __init__(self, variance_focus=0.85, eps=1e-8):
         super(SILogLoss, self).__init__()
         self.variance_focus = variance_focus
@@ -25,9 +22,7 @@ class SILogLoss(nn.Module):
 
 
 class GradientLoss(nn.Module):
-    """
-    Gradient Loss để khuyến khích sự mượt mà trong bản đồ độ sâu.
-    """
+   
     def __init__(self):
         super(GradientLoss, self).__init__()
 
@@ -50,9 +45,6 @@ class GradientLoss(nn.Module):
 
 
 class DepthLoss(nn.Module):
-    """
-    Hàm loss tổng hợp cho ước lượng độ sâu, sử dụng MSELoss, SILogLoss và GradientLoss.
-    """
     def __init__(self, alpha=1.0, beta=0.1, delta=0.1):
         super(DepthLoss, self).__init__()
         self.mse_loss = nn.MSELoss()
