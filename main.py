@@ -1,4 +1,3 @@
-# trainer.py
 
 import os
 import numpy as np
@@ -12,7 +11,7 @@ import torch.nn.functional as F
 from model import CombinedDepthModel
 from dataloader import DataLoadPreprocess
 from evaluation import compute_metrics
-from loss import ScaleInvariantLoss
+from loss import DepthLoss  # Điều chỉnh import để sử dụng DepthLoss
 
 from torchvision import transforms
 from torch.utils.tensorboard import SummaryWriter
@@ -30,7 +29,7 @@ class BaseTrainer:
         early_stopping_patience=15,
         initial_lr=1e-4,
         max_grad_norm=1.0,
-        validation_interval=0.5
+        validation_interval=0.25  # Giữ nguyên giá trị 0.25 cho đánh giá mỗi 25%
     ):
         self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model = model.to(self.device)
@@ -45,7 +44,7 @@ class BaseTrainer:
 
         self.optimizer = optim.Adam(self.model.parameters(), lr=initial_lr)
         self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=20, gamma=0.5)
-        self.criterion = ScaleInvariantLoss().to(self.device)
+        self.criterion = DepthLoss(alpha=1.0, beta=0.1, delta=0.1).to(self.device)  # Sử dụng DepthLoss
 
         self.best_val_loss = float('inf')
         self.epochs_no_improve = 0
@@ -71,13 +70,13 @@ class BaseTrainer:
         with torch.set_grad_enabled(training):
             depth_map = self.model(images)
             epsilon = 1e-6
-            depth_map = depth_map + epsilon
+            depth_map = F.softplus(depth_map) + epsilon  # Đảm bảo giá trị độ sâu dương
 
             depth_map = self._resize_depth_map(depth_map, depths)
 
             mask = self._mask_depth(depths)
             if masks is not None:
-                mask = mask * masks 
+                mask = mask * masks  # Kết hợp mask từ dữ liệu và depth range
 
             # Áp dụng mask
             depth_map = depth_map * mask
@@ -200,7 +199,7 @@ def main():
     transform = transforms.Compose([
         transforms.Resize((384, 384)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],  # Normalization theo ImageNet
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],  # Chuẩn hóa theo ImageNet
                              std=[0.229, 0.224, 0.225]),
     ])
 
@@ -211,7 +210,15 @@ def main():
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
-    trainer = BaseTrainer(model, train_loader, test_loader, device=device, num_epochs=100, early_stopping_patience=15, validation_interval=0.5)
+    trainer = BaseTrainer(
+        model,
+        train_loader,
+        test_loader,
+        device=device,
+        num_epochs=100,
+        early_stopping_patience=15,
+        validation_interval=0.25  # Đánh giá mỗi 25% dữ liệu
+    )
     trainer.train()
     trainer.evaluate_model()
     trainer.save_checkpoint('combined_model.pth')
