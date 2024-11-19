@@ -3,56 +3,29 @@
 import os
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import Dataset
 from PIL import Image
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
-import torchvision.transforms.functional as TF
 import random
 
 def remove_leading_slash(s):
     return s.lstrip('/\\')
 
 class DataLoadPreprocess(Dataset):
-    def __init__(self, mode, **kwargs):
+    def __init__(self, mode, transform=None):
         self.mode = mode
-
-        # Define image transform (including data augmentation)
-        self.image_transform = transforms.Compose([
-            transforms.Pad((0, 0, 14 - (640 % 14), 14 - (480 % 14))),  # Add padding to make dimensions divisible by 14
-            transforms.Resize((364, 364)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406],  # Normalization theo ImageNet
-                                 std=[0.229, 0.224, 0.225]),
-        ])
-
-        # Define depth transform
-        self.depth_transform = transforms.Compose([
-            transforms.Pad((0, 0, 14 - (640 % 14), 14 - (480 % 14))),
-            transforms.Resize((364, 364), interpolation=InterpolationMode.NEAREST),
-            transforms.ToTensor(),
-        ])
-
-        # Define data augmentation transforms
-        if mode == 'train':
-            self.augmentation = transforms.Compose([
-                transforms.RandomHorizontalFlip(p=0.5),
-                transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
-                transforms.RandomRotation(degrees=15, interpolation=InterpolationMode.BILINEAR),
-                transforms.RandomResizedCrop(size=364, scale=(0.8, 1.0)),
-            ])
-        else:
-            self.augmentation = None  # Không áp dụng augmentation cho validation/test
+        self.transform = transform
 
         # Paths to data (Update these paths according to your dataset location)
         base_path = r'C:\filemohinh\modelmoi\train'  # Base directory for your data
 
         if mode == 'train':
-            self.data_path = base_path  # Path to training images and depths
-            self.filenames_file = os.path.join(base_path, 'nyudepthv2_train_files_with_gt.txt')  # Path to your train.txt file
+            self.data_path = base_path
+            self.filenames_file = os.path.join(base_path, 'nyudepthv2_train_files_with_gt.txt')
         else:
-            self.data_path = base_path  # Path to test images and depths
-            self.filenames_file = os.path.join(base_path, 'nyudepthv2_test_files_with_gt.txt')  # Path to your test.txt file
+            self.data_path = base_path
+            self.filenames_file = os.path.join(base_path, 'nyudepthv2_test_files_with_gt.txt')
 
         # Read the list of filenames
         with open(self.filenames_file, 'r') as f:
@@ -61,6 +34,16 @@ class DataLoadPreprocess(Dataset):
         # Depth limits
         self.min_depth = 0.1
         self.max_depth = 10.0
+
+        # Data augmentation transforms
+        if mode == 'train':
+            self.augmentation = transforms.Compose([
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.RandomRotation(degrees=5, interpolation=InterpolationMode.BILINEAR),
+                transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05),
+            ])
+        else:
+            self.augmentation = None
 
     def __getitem__(self, idx):
         sample_line = self.filenames[idx].strip()
@@ -82,54 +65,41 @@ class DataLoadPreprocess(Dataset):
         depth_gt = Image.open(depth_path)
 
         # Apply data augmentation if in training mode
-        if self.mode == 'train':
-            # Apply the same transformation to both image and depth
-            # Random Horizontal Flip
-            if random.random() < 0.5:
-                image = TF.hflip(image)
-                depth_gt = TF.hflip(depth_gt)
-
-            # Random Rotation
-            angle = random.uniform(-15, 15)
-            image = TF.rotate(image, angle, interpolation=InterpolationMode.BILINEAR)
-            depth_gt = TF.rotate(depth_gt, angle, interpolation=InterpolationMode.NEAREST)
-
-            # Random Resized Crop
-            i, j, h, w = transforms.RandomResizedCrop.get_params(
-                image, scale=(0.8, 1.0), ratio=(0.9, 1.1))
-            image = TF.resized_crop(image, i, j, h, w, size=(364, 364), interpolation=InterpolationMode.BILINEAR)
-            depth_gt = TF.resized_crop(depth_gt, i, j, h, w, size=(364, 364), interpolation=InterpolationMode.NEAREST)
-
-            # Color Jitter (applied only to image)
+        if self.mode == 'train' and self.augmentation is not None:
+            # Sử dụng cùng một seed cho cả image và depth để áp dụng cùng một phép biến đổi
+            seed = np.random.randint(2147483647)
+            random.seed(seed)
+            torch.manual_seed(seed)
             image = self.augmentation(image)
+            random.seed(seed)
+            torch.manual_seed(seed)
+            depth_gt = self.augmentation(depth_gt)
 
         # Apply transforms
-        image = self.image_transform(image)
-        depth_gt = self.depth_transform(depth_gt).squeeze(0) / 1000.0  # Convert from mm to meters
+        if self.transform is not None:
+            image = self.transform(image)
+            depth_gt = self.transform(depth_gt)
+        else:
+            # Nếu không có transform, chuyển đổi thành tensor và chuẩn hóa
+            image = transforms.ToTensor()(image)
+            image = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                         std=[0.229, 0.224, 0.225])(image)
+            depth_gt = transforms.ToTensor()(depth_gt)
+
+        depth_gt = depth_gt.squeeze(0) / 1000.0  # Convert from mm to meters
 
         # Create mask
         mask = (depth_gt > self.min_depth) & (depth_gt < self.max_depth)
         mask = mask.float().unsqueeze(0)  # Add channel dimension
 
-        # If segmentation labels are available, load them
-        # Assuming that segmentation labels are in the 4th column of sample_items
-        if len(sample_items) >= 4:
-            seg_rel_path = sample_items[3]
-            seg_path = os.path.join(self.data_path, remove_leading_slash(seg_rel_path))
-            seg_gt = Image.open(seg_path)
-            seg_gt = transforms.Resize((364, 364), interpolation=InterpolationMode.NEAREST)(seg_gt)
-            seg_gt = transforms.ToTensor()(seg_gt).long().squeeze(0)
-            sample = {'image': image, 'depth': depth_gt, 'focal': focal, 'mask': mask, 'segmentation': seg_gt}
-        else:
-            sample = {'image': image, 'depth': depth_gt, 'focal': focal, 'mask': mask}
+        sample = {'image': image, 'depth': depth_gt, 'focal': focal, 'mask': mask}
 
         return sample
 
     def __len__(self):
         return len(self.filenames)
 
-
-# If you want to test the dataset
+# Nếu bạn muốn kiểm tra dataset
 if __name__ == '__main__':
     dataset = DataLoadPreprocess(mode='train')
 
@@ -140,5 +110,3 @@ if __name__ == '__main__':
     print("Depth shape:", sample['depth'].shape)
     print("Focal length:", sample['focal'])
     print("Mask shape:", sample['mask'].shape)
-    if 'segmentation' in sample:
-        print("Segmentation shape:", sample['segmentation'].shape)
