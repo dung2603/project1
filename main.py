@@ -11,8 +11,7 @@ import torch.nn.functional as F
 from model import CombinedDepthModel
 from dataloader import DataLoadPreprocess
 from evaluation import compute_metrics
-from loss import DepthLoss  # Điều chỉnh import để sử dụng DepthLoss
-
+from loss import DepthLoss
 from torchvision import transforms
 from torch.utils.tensorboard import SummaryWriter
 
@@ -29,7 +28,7 @@ class BaseTrainer:
         early_stopping_patience=15,
         initial_lr=1e-4,
         max_grad_norm=1.0,
-        validation_interval=0.25  # Giữ nguyên giá trị 0.25 cho đánh giá mỗi 25%
+        validation_interval=0.25
     ):
         self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model = model.to(self.device)
