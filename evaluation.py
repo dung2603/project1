@@ -34,8 +34,18 @@ def compute_metrics(pred, gt, mask=None):
     # Compute absolute relative error
     abs_rel = torch.mean(torch.abs(gt - pred) / gt)
 
+    # Compute squared relative error
+    sq_rel = torch.mean((gt - pred) ** 2 / gt)
+
     # Compute RMSE
     rmse = torch.sqrt(torch.mean((gt - pred) ** 2))
+
+    # Compute RMSE (log scale)
+    rmse_log = torch.sqrt(torch.mean((torch.log(gt) - torch.log(pred)) ** 2))
+
+    # Compute SILog
+    err = torch.log(pred) - torch.log(gt)
+    silog = torch.sqrt(torch.mean(err ** 2) - torch.mean(err) ** 2) * 100
 
     # Compute log10 error
     log10 = torch.mean(torch.abs(torch.log10(gt) - torch.log10(pred)))
@@ -49,7 +59,10 @@ def compute_metrics(pred, gt, mask=None):
 
     metrics = {
         'abs_rel': abs_rel.item(),
+        'sq_rel': sq_rel.item(),
         'rmse': rmse.item(),
+        'rmse_log': rmse_log.item(),
+        'silog': silog.item(),
         'log10': log10.item(),
         'a1': a1.item(),
         'a2': a2.item(),
