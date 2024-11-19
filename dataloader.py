@@ -1,5 +1,3 @@
-# dataloader.py
-
 import os
 import numpy as np
 import torch
@@ -7,6 +5,7 @@ from torch.utils.data import Dataset
 from PIL import Image
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
+import torchvision.transforms.functional as TF
 import random
 
 def remove_leading_slash(s):
@@ -18,7 +17,7 @@ class DataLoadPreprocess(Dataset):
         self.transform = transform
 
         # Paths to data (Update these paths according to your dataset location)
-        base_path = r'C:\filemohinh\modelmoi\train'  # Base directory for your data
+        base_path = "/content/project1/train"  # Base directory for your data
 
         if mode == 'train':
             self.data_path = base_path
@@ -37,13 +36,32 @@ class DataLoadPreprocess(Dataset):
 
         # Data augmentation transforms
         if mode == 'train':
-            self.augmentation = transforms.Compose([
+            # Geometric transformations
+            self.geometric_transforms = transforms.Compose([
                 transforms.RandomHorizontalFlip(p=0.5),
                 transforms.RandomRotation(degrees=5, interpolation=InterpolationMode.BILINEAR),
-                transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05),
+                transforms.RandomResizedCrop(size=(384, 384), scale=(0.8, 1.0)),
             ])
+            # Color transformations
+            self.color_transforms = transforms.ColorJitter(
+                brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05
+            )
         else:
-            self.augmentation = None
+            self.geometric_transforms = None
+            self.color_transforms = None
+
+        # Define transforms for image and depth
+        self.image_transform = transforms.Compose([
+            transforms.Resize((384, 384)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],  # Chuẩn hóa theo ImageNet
+                                 std=[0.229, 0.224, 0.225]),
+        ])
+
+        self.depth_transform = transforms.Compose([
+            transforms.Resize((384, 384), interpolation=InterpolationMode.NEAREST),
+            transforms.ToTensor(),
+        ])
 
     def __getitem__(self, idx):
         sample_line = self.filenames[idx].strip()
@@ -65,32 +83,36 @@ class DataLoadPreprocess(Dataset):
         depth_gt = Image.open(depth_path)
 
         # Apply data augmentation if in training mode
-        if self.mode == 'train' and self.augmentation is not None:
-            # Sử dụng cùng một seed cho cả image và depth để áp dụng cùng một phép biến đổi
+        if self.mode == 'train':
+            # Use the same seed for both image and depth_gt to apply the same geometric transformations
             seed = np.random.randint(2147483647)
             random.seed(seed)
             torch.manual_seed(seed)
-            image = self.augmentation(image)
+            if self.geometric_transforms is not None:
+                image = self.geometric_transforms(image)
             random.seed(seed)
             torch.manual_seed(seed)
-            depth_gt = self.augmentation(depth_gt)
+            if self.geometric_transforms is not None:
+                depth_gt = self.geometric_transforms(depth_gt)
+
+            # Apply color jitter only to the image
+            if self.color_transforms is not None:
+                image = self.color_transforms(image)
 
         # Apply transforms
         if self.transform is not None:
             image = self.transform(image)
-            depth_gt = self.transform(depth_gt)
+            depth_gt = self.depth_transform(depth_gt)
         else:
             # Nếu không có transform, chuyển đổi thành tensor và chuẩn hóa
-            image = transforms.ToTensor()(image)
-            image = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                         std=[0.229, 0.224, 0.225])(image)
-            depth_gt = transforms.ToTensor()(depth_gt)
+            image = self.image_transform(image)
+            depth_gt = self.depth_transform(depth_gt)
 
         depth_gt = depth_gt.squeeze(0) / 1000.0  # Convert from mm to meters
 
         # Create mask
         mask = (depth_gt > self.min_depth) & (depth_gt < self.max_depth)
-        mask = mask.float().unsqueeze(0)  # Add channel dimension
+        mask = mask.float()  # Không cần unsqueeze nếu đã có chiều phù hợp
 
         sample = {'image': image, 'depth': depth_gt, 'focal': focal, 'mask': mask}
 
@@ -98,15 +120,3 @@ class DataLoadPreprocess(Dataset):
 
     def __len__(self):
         return len(self.filenames)
-
-# Nếu bạn muốn kiểm tra dataset
-if __name__ == '__main__':
-    dataset = DataLoadPreprocess(mode='train')
-
-    # Get one sample
-    sample = dataset[0]
-
-    print("Image shape:", sample['image'].shape)
-    print("Depth shape:", sample['depth'].shape)
-    print("Focal length:", sample['focal'])
-    print("Mask shape:", sample['mask'].shape)
