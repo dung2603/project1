@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from torchvision.models.segmentation import deeplabv3_resnet50
 from typing import List
 
-from unet_model import UNet
+from .unet_model import UNet
 from .zoedepthcore import ZoeCore
 
 class SimpleFusionBlock(nn.Module):
