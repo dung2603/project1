@@ -1,15 +1,14 @@
-# model.py
-
-import torch
+import torch 
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.models.segmentation import deeplabv3_resnet50
 from typing import List
-from .unet_model import UNet
-# Import ZoeCore
-from .zoedepthcore import ZoeCore  # Điều chỉnh đường dẫn import nếu cần
+
+from unet_model import UNet
+from .zoedepthcore import ZoeCore
 
 class SimpleFusionBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int):
         super(SimpleFusionBlock, self).__init__()
         self.conv = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
@@ -24,83 +23,55 @@ class SimpleFusionBlock(nn.Module):
         return self.conv(x)
 
 class UNetDecoder(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, bilinear: bool = False):
+    def __init__(self, in_channels, out_channels, bilinear=False):
         super(UNetDecoder, self).__init__()
         self.unet = UNet(n_channels=in_channels, n_classes=out_channels, bilinear=bilinear)
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+
+    def forward(self, x):
         return self.unet(x)
 
 class CombinedDepthModel(nn.Module):
-    def __init__(
-        self,
-        zoe_model_name: str = "ZoeD_N",
-        fusion_out_channels: int = 128,
-        unet_bilinear: bool = False,
-        depth_key: str = "metric_depth" 
-    ):
+    def __init__(self, core, semantic_feature_channels: int, unet_out_channels: int = 1, bilinear: bool = False):
         super(CombinedDepthModel, self).__init__()
-        self.model_zoe = ZoeCore.build(
-            zoe_model_name=zoe_model_name,
-            trainable=False,
-            use_pretrained=True,
-            fetch_features=False, 
-            freeze_bn=True,
-            keep_aspect_ratio=True,
-            img_size=384,
-            depth_key=depth_key 
-        )
-        segmentation_model = deeplabv3_resnet50(pretrained=True)
-        self.segmentation_backbone = segmentation_model.backbone
-
+        self.core = core
+        self.segmentation_backbone = deeplabv3_resnet50(pretrained=True)
         self.segmentation_backbone.eval()
         for param in self.segmentation_backbone.parameters():
-            param.requires_grad = False
+            param.requires_grad = False 
+        C_zoe = core.output_channels[0] 
+        self.fusion_block = SimpleFusionBlock(in_channels=C_zoe + semantic_feature_channels, out_channels=128)
 
-        seg_channels = 2048 
-        zoe_channels = 1      
-        combined_channels = seg_channels + zoe_channels 
+        # Bộ giải mã UNet
+        self.unet_decoder = UNetDecoder(in_channels=128, out_channels=unet_out_channels, bilinear=bilinear)
 
-        # Định nghĩa fusion block
-        self.fusion_block = SimpleFusionBlock(combined_channels, fusion_out_channels)
+    def forward(self, x, return_final_centers=False, denorm=False, return_probs=False, **kwargs):
+        _, _, h, w = x.shape
+        self.orig_input_width = w
+        self.orig_input_height = h
+        rel_depth, out = self.core(x, denorm=denorm, return_rel_depth=True)
 
-        # Định nghĩa UNet decoder
-        self.unet_decoder = UNetDecoder(in_channels=fusion_out_channels, out_channels=1, bilinear=unet_bilinear)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        self.model_zoe.eval()
-        self.segmentation_backbone.eval()
-
+        outconv_activation = out[0]
+        last = outconv_activation
         with torch.no_grad():
-            features_zoe = self._extract_depth_features(x) 
+            segmentation_output = self.segmentation_backbone(x)['out']
+        semantic_features = segmentation_output
+        semantic_features = self._resize_features(semantic_features, last.shape[2:])
+        combined_features = torch.cat([last, semantic_features], dim=1)  # (B, C_zoe + S, H', W')
+        fused_features = self.fusion_block(combined_features)  # (B, 128, H', W')
+        metric_depth = self.unet_decoder(fused_features)  # (B, 1, H, W)
+        output = dict(metric_depth=metric_depth)
+        if return_final_centers or return_probs:
+            if len(out) > 1:
+                bin_centers = out[1]
+                bin_centers = self._resize_features(bin_centers, metric_depth.shape[2:])
+                output['bin_centers'] = bin_centers
 
-            features_seg = self._extract_segmentation_features(x)  # Shape: (B, 2048, H/16, W/16)
-
-        features_seg_resized = self._resize_features(features_seg, features_zoe.shape[2:])  # (B, 2048, H, W)
-        combined_features = torch.cat((features_zoe, features_seg_resized), dim=1)  # Shape: (B, 2049, H, W)
-        fused_features = self.fusion_block(combined_features)  # Shape: (B, fusion_out_channels, H, W)
-        depth_map = self.unet_decoder(fused_features)  # Shape: (B, 1, H, W)
-
-        return depth_map
-
-    def _extract_depth_features(self, x: torch.Tensor) -> torch.Tensor:
-        features_zoe = self.model_zoe(x)  # ZoeCore's forward method
-
-        if not isinstance(features_zoe, torch.Tensor):
-            raise ValueError(f"Unexpected type for features_zoe: {type(features_zoe)}. Expected torch.Tensor.")
-
-        if features_zoe.dim() == 3:
-            features_zoe = features_zoe.unsqueeze(1)  # Ensure shape: (B, 1, H, W)
-        elif features_zoe.dim() != 4 or features_zoe.size(1) != 1:
-            raise ValueError(f"Unexpected shape for features_zoe: {features_zoe.shape}")
-
-        return features_zoe
-
-    def _extract_segmentation_features(self, x: torch.Tensor) -> torch.Tensor:
-        features_seg_dict = self.segmentation_backbone(x)
-
-        # Sử dụng khóa 'out' thay vì 'layer4'
-        features_seg = features_seg_dict['out']  # Điều chỉnh khóa này nếu cần thiết
-        return features_seg
+        if return_probs:
+            if len(out) > 2:
+                probs = out[2] 
+                probs = self._resize_features(probs, metric_depth.shape[2:])
+                output['probs'] = probs
+        return output
 
     def _resize_features(self, features: torch.Tensor, target_size: tuple) -> torch.Tensor:
         if features.shape[2:] != target_size:
@@ -117,15 +88,25 @@ class CombinedDepthModel(nn.Module):
             if any(layer in name for layer in layers_to_unfreeze):
                 param.requires_grad = True
 
-        for name, param in self.model_zoe.named_parameters():
+        for name, param in self.core.named_parameters():
             if any(layer in name for layer in layers_to_unfreeze):
                 param.requires_grad = True
 
-    def freeze_backbone_layers(self, layers_to_freeze: List[str]) -> None
+    def freeze_backbone_layers(self, layers_to_freeze: List[str]) -> None:
         for name, param in self.segmentation_backbone.named_parameters():
             if any(layer in name for layer in layers_to_freeze):
                 param.requires_grad = False
 
-        for name, param in self.model_zoe.named_parameters():
+        for name, param in self.core.named_parameters():
             if any(layer in name for layer in layers_to_freeze):
                 param.requires_grad = False
+
+    @staticmethod
+    def build(zoe_model_name="ZoeD_N", trainable=False, use_pretrained=True, fetch_features=True, freeze_bn=True, 
+              keep_aspect_ratio=True, img_size=384, semantic_feature_channels: int = 21, unet_out_channels: int = 1, bilinear: bool = False, **kwargs):
+        model = torch.hub.load("isl-org/ZoeDepth", zoe_model_name, pretrained=use_pretrained)
+        core = ZoeCore(model, trainable=trainable, fetch_features=fetch_features,
+                      freeze_bn=freeze_bn, keep_aspect_ratio=keep_aspect_ratio, img_size=img_size, **kwargs)
+        combined_model = CombinedDepthModel(core, semantic_feature_channels=semantic_feature_channels, 
+                                            unet_out_channels=unet_out_channels, bilinear=bilinear, **kwargs)
+        return combined_model
