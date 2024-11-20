@@ -197,12 +197,18 @@ def main():
     depth_key = "metric_depth"
 
   
-    model = CombinedDepthModel(
-        zoe_model_name="ZoeD_N", 
-        fusion_out_channels=128, 
-        unet_bilinear=False,
-        depth_key=depth_key 
-    )
+    model = CombinedDepthModel.build(
+    zoe_model_name="ZoeD_N",  
+    trainable=False,           
+    use_pretrained=True,      
+    fetch_features=True,
+    freeze_bn=True,
+    keep_aspect_ratio=True,
+    img_size=384,
+    semantic_feature_channels=21,  
+    unet_out_channels=1,        
+    bilinear=False
+)
     transform = transforms.Compose([
         transforms.Resize((384, 384)),
         transforms.ToTensor(),
