@@ -2,11 +2,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.models.segmentation import deeplabv3_resnet50
-import torch.hub
 from typing import List
 
-from .unet_parts import DoubleConv, Down, Up, OutConv
-from .unet_model import UNet
+# Import ZoeCore
+from .zoedepthcore import ZoeCore  # Adjust the import path as needed
 
 class SimpleFusionBlock(nn.Module):
     """
@@ -64,7 +63,6 @@ class CombinedDepthModel(nn.Module):
 
     def __init__(
         self,
-        zoe_repo: str = "isl-org/ZoeDepth",
         zoe_model_name: str = "ZoeD_N",
         fusion_out_channels: int = 128,
         unet_bilinear: bool = False
@@ -73,15 +71,22 @@ class CombinedDepthModel(nn.Module):
         Initializes the CombinedDepthModel.
 
         Args:
-            zoe_repo (str): Repository name for ZoeDepth on torch.hub.
             zoe_model_name (str): Model name for ZoeDepth.
             fusion_out_channels (int): Number of output channels for fusion block.
             unet_bilinear (bool): Whether to use bilinear upsampling in UNet.
         """
         super(CombinedDepthModel, self).__init__()
 
-        # Load ZoeDepth pre-trained model
-        self.model_zoe = torch.hub.load(zoe_repo, zoe_model_name, pretrained=True)
+        # Initialize ZoeCore
+        self.model_zoe = ZoeCore.build(
+            zoe_model_name=zoe_model_name,
+            trainable=False,
+            use_pretrained=True,
+            fetch_features=False,
+            freeze_bn=True,
+            keep_aspect_ratio=True,
+            img_size=384
+        )
 
         # Load DeepLabV3 model for semantic segmentation with ResNet-50 backbone
         segmentation_model = deeplabv3_resnet50(pretrained=True)
@@ -108,7 +113,7 @@ class CombinedDepthModel(nn.Module):
         Returns:
             torch.Tensor: Predicted depth map of shape (B, 1, H, W).
         """
-        # Extract depth features from ZoeDepth
+        # Extract depth features from ZoeCore
         features_zoe = self._extract_depth_features(x)  # Expected shape: (B, 1, H, W)
 
         # Extract segmentation features from DeepLabV3 backbone
@@ -130,7 +135,7 @@ class CombinedDepthModel(nn.Module):
 
     def _extract_depth_features(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Extracts depth features using ZoeDepth model.
+        Extracts depth features using ZoeCore.
 
         Args:
             x (torch.Tensor): Input image tensor of shape (B, 3, H, W).
@@ -138,7 +143,7 @@ class CombinedDepthModel(nn.Module):
         Returns:
             torch.Tensor: Depth features tensor of shape (B, 1, H, W).
         """
-        features_zoe = self.model_zoe.infer(x)  # Expected shape: (B, 1, H, W)
+        features_zoe = self.model_zoe(x)  # ZoeCore's forward method
 
         if features_zoe.dim() == 3:
             features_zoe = features_zoe.unsqueeze(1)  # Ensure shape: (B, 1, H, W)
