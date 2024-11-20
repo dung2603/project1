@@ -1,3 +1,5 @@
+# zoedepthcore.py
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -27,28 +29,6 @@ class Resize(object):
         ensure_multiple_of=1,
         resize_method="lower_bound",
     ):
-        """Init.
-        Args:
-            width (int): desired output width
-            height (int): desired output height
-            resize_target (bool, optional):
-                True: Resize the full sample (image, mask, target).
-                False: Resize image only.
-                Defaults to True.
-            keep_aspect_ratio (bool, optional):
-                True: Keep the aspect ratio of the input sample.
-                Output sample might not have the given width and height, and
-                resize behaviour depends on the parameter 'resize_method'.
-                Defaults to False.
-            ensure_multiple_of (int, optional):
-                Output width and height is constrained to be multiple of this parameter.
-                Defaults to 1.
-            resize_method (str, optional):
-                "lower_bound": Output will be at least as large as the given size.
-                "upper_bound": Output will be at max as large as the given size. (Output size might be smaller than given size.)
-                "minimal": Scale as least as possible.  (Output size might be smaller than given size.)
-                Defaults to "lower_bound".
-        """
         print("Params passed to Resize transform:")
         print("\twidth: ", width)
         print("\theight: ", height)
@@ -65,6 +45,17 @@ class Resize(object):
         self.__resize_method = resize_method
 
     def constrain_to_multiple_of(self, x, min_val=0, max_val=None):
+        """
+        Constrain a value to be a multiple of a specified number.
+        
+        Args:
+            x (float): Input value.
+            min_val (int, optional): Minimum value. Defaults to 0.
+            max_val (int, optional): Maximum value. Defaults to None.
+        
+        Returns:
+            int: Constrained value.
+        """
         y = (np.round(x / self.__multiple_of) * self.__multiple_of).astype(int)
 
         if max_val is not None and y > max_val:
@@ -78,34 +69,28 @@ class Resize(object):
         return y
 
     def get_size(self, width, height):
-        # determine new height and width
+        # Determine scale factors
         scale_height = self.__height / height
         scale_width = self.__width / width
 
         if self.__keep_aspect_ratio:
             if self.__resize_method == "lower_bound":
-                # scale such that output size is lower bound
+                # Scale such that output size is at least as large as the given size
                 if scale_width > scale_height:
-                    # fit width
                     scale_height = scale_width
                 else:
-                    # fit height
                     scale_width = scale_height
             elif self.__resize_method == "upper_bound":
-                # scale such that output size is upper bound
+                # Scale such that output size is at max as large as the given size
                 if scale_width < scale_height:
-                    # fit width
                     scale_height = scale_width
                 else:
-                    # fit height
                     scale_width = scale_height
             elif self.__resize_method == "minimal":
-                # scale as least as possbile
+                # Scale as least as possible
                 if abs(1 - scale_width) < abs(1 - scale_height):
-                    # fit width
                     scale_height = scale_width
                 else:
-                    # fit height
                     scale_width = scale_height
             else:
                 raise ValueError(
@@ -155,7 +140,7 @@ class PrepForZoeDepth(object):
 
 class ZoeCore(nn.Module):
     def __init__(self, zoe_model, trainable=False, fetch_features=False,
-                 keep_aspect_ratio=True, layer_names=('out_conv', 'l4_rn', 'r4', 'r3', 'r2', 'r1'), 
+                 keep_aspect_ratio=True, layer_names=('output_conv', 'layer4_rn', 'refinenet4', 'refinenet3', 'refinenet2', 'refinenet1'), 
                  img_size=384, depth_key='metric_depth', **kwargs):
         super().__init__()
         self.core = zoe_model
@@ -165,11 +150,20 @@ class ZoeCore(nn.Module):
         self.core_out = {}
         self.handles = [] 
         self.depth_key = depth_key
+
+        # Define output_channels based on layer_names and ZoeDepth's architecture
+        # From the architecture:
+        # 'output_conv' outputs 32 channels
+        # 'layer4_rn', 'refinenet4', 'refinenet3', 'refinenet2', 'refinenet1' each output 256 channels
+        self.output_channels = [32, 256, 256, 256, 256, 256]
+
         self.set_trainable(trainable)
         self.prep = PrepForZoeDepth(keep_aspect_ratio=keep_aspect_ratio,
                                     img_size=img_size, do_resize=kwargs.get('do_resize', True))
         if kwargs.get('freeze_bn', False):
             self.freeze_bn()
+        if self.fetch_features:
+            self.attach_hooks(self.core)
 
     def set_trainable(self, trainable):
         self.trainable = trainable
@@ -252,18 +246,52 @@ class ZoeCore(nn.Module):
     def attach_hooks(self, zoe_model):
         if len(self.handles) > 0:
             self.remove_hooks()
-        if "out_conv" in self.layer_names:
-            self.handles.append(list(zoe_model.scratch.output_conv.children())[3].register_forward_hook(get_activation("out_conv", self.core_out)))
-        if "r4" in self.layer_names:
-            self.handles.append(zoe_model.scratch.refinenet4.register_forward_hook(get_activation("r4", self.core_out)))
-        if "r3" in self.layer_names:
-            self.handles.append(zoe_model.scratch.refinenet3.register_forward_hook(get_activation("r3", self.core_out)))
-        if "r2" in self.layer_names:
-            self.handles.append(zoe_model.scratch.refinenet2.register_forward_hook(get_activation("r2", self.core_out)))
-        if "r1" in self.layer_names:
-            self.handles.append(zoe_model.scratch.refinenet1.register_forward_hook(get_activation("r1", self.core_out)))
-        if "l4_rn" in self.layer_names:
-            self.handles.append(zoe_model.scratch.layer4_rn.register_forward_hook(get_activation("l4_rn", self.core_out)))
+        # Access the 'scratch' module correctly via core.core.scratch
+        scratch = zoe_model.core.core.scratch
+
+        if "output_conv" in self.layer_names:
+            # Hook to the Conv2d(128,32) layer in output_conv
+            self.handles.append(
+                list(scratch.output_conv.children())[2].register_forward_hook(
+                    get_activation("output_conv", self.core_out)
+                )
+            )
+        if "layer4_rn" in self.layer_names:
+            self.handles.append(
+                scratch.layer4_rn.register_forward_hook(
+                    get_activation("layer4_rn", self.core_out)
+                )
+            )
+        if "refinenet4" in self.layer_names:
+            self.handles.append(
+                scratch.refinenet4.register_forward_hook(
+                    get_activation("refinenet4", self.core_out)
+                )
+            )
+        if "refinenet3" in self.layer_names:
+            self.handles.append(
+                scratch.refinenet3.register_forward_hook(
+                    get_activation("refinenet3", self.core_out)
+                )
+            )
+        if "refinenet2" in self.layer_names:
+            self.handles.append(
+                scratch.refinenet2.register_forward_hook(
+                    get_activation("refinenet2", self.core_out)
+                )
+            )
+        if "refinenet1" in self.layer_names:
+            self.handles.append(
+                scratch.refinenet1.register_forward_hook(
+                    get_activation("refinenet1", self.core_out)
+                )
+            )
+        if "layer1_rn" in self.layer_names:
+            self.handles.append(
+                scratch.layer1_rn.register_forward_hook(
+                    get_activation("layer1_rn", self.core_out)
+                )
+            )
 
         return self
 
@@ -278,10 +306,20 @@ class ZoeCore(nn.Module):
 
     @staticmethod
     def build(zoe_model_name="ZoeD_N", trainable=False, use_pretrained=True, fetch_features=False, freeze_bn=True, keep_aspect_ratio=True, img_size=384, depth_key='metric_depth', **kwargs):
-        # Load ZoeDepth model
-        zoe_model = torch.hub.load("isl-org/ZoeDepth", zoe_model_name, pretrained=use_pretrained)
+            "isl-org/ZoeDepth",
+            zoe_model_name,
+            pretrained=use_pretrained,
+            trust_repo=True
+        )
         print(zoe_model)
-        zoe_core = ZoeCore(zoe_model, trainable=trainable, fetch_features=fetch_features,
-                           freeze_bn=freeze_bn, keep_aspect_ratio=keep_aspect_ratio, 
-                           img_size=img_size, depth_key=depth_key, **kwargs)
+        zoe_core = ZoeCore(
+            zoe_model,
+            trainable=trainable,
+            fetch_features=fetch_features,
+            freeze_bn=freeze_bn,
+            keep_aspect_ratio=keep_aspect_ratio, 
+            img_size=img_size,
+            depth_key=depth_key,
+            **kwargs
+        )
         return zoe_core
