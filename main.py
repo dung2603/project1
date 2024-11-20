@@ -194,7 +194,15 @@ def main():
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     print(f"Using device: {device}")
 
-    model = CombinedDepthModel()
+    depth_key = "metric_depth"
+
+  
+    model = CombinedDepthModel(
+        zoe_model_name="ZoeD_N", 
+        fusion_out_channels=128, 
+        unet_bilinear=False,
+        depth_key=depth_key 
+    )
     transform = transforms.Compose([
         transforms.Resize((384, 384)),
         transforms.ToTensor(),
