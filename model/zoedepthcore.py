@@ -5,14 +5,6 @@ from torchvision.transforms import Normalize
 import numpy as np
 
 def denormalize(x):
-    """Đảo ngược quá trình chuẩn hóa ImageNet áp dụng cho đầu vào.
-
-    Args:
-        x (torch.Tensor): Tensor đầu vào có dạng (N, 3, H, W)
-
-    Returns:
-        torch.Tensor: Tensor đã được đảo ngược chuẩn hóa
-    """
     mean = torch.Tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(x.device)
     std = torch.Tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(x.device)
     return x * std + mean
@@ -148,7 +140,6 @@ class Resize(object):
         return nn.functional.interpolate(x, (height, width), mode='bilinear', align_corners=True)
 
 class PrepForZoeDepth(object):
-    """Chuẩn bị dữ liệu đầu vào cho ZoeDepth."""
     def __init__(self, resize_mode="minimal", keep_aspect_ratio=True, img_size=384, do_resize=True):
         if isinstance(img_size, int):
             img_size = (img_size, img_size)
@@ -163,13 +154,17 @@ class PrepForZoeDepth(object):
         return x
 
 class ZoeCore(nn.Module):
-    """Lớp ZoeCore dùng để trích xuất đặc trưng từ ZoeDepth."""
     def __init__(self, zoe_model, trainable=False, fetch_features=False,
-                 keep_aspect_ratio=True, layer_names=('out_conv', 'l4_rn', 'r4', 'r3', 'r2', 'r1'), img_size=384, **kwargs):
+                 keep_aspect_ratio=True, layer_names=('out_conv', 'l4_rn', 'r4', 'r3', 'r2', 'r1'), 
+                 img_size=384, depth_key='metric_depth', **kwargs):
         super().__init__()
         self.core = zoe_model
         self.trainable = trainable
         self.fetch_features = fetch_features
+        self.layer_names = layer_names
+        self.core_out = {}
+        self.handles = [] 
+        self.depth_key = depth_key
         self.set_trainable(trainable)
         self.prep = PrepForZoeDepth(keep_aspect_ratio=keep_aspect_ratio,
                                     img_size=img_size, do_resize=kwargs.get('do_resize', True))
@@ -219,17 +214,21 @@ class ZoeCore(nn.Module):
             # print("Shape after prep: ", x.shape)
 
         with torch.set_grad_enabled(self.trainable):
-
-            # print("Input size to Midascore", x.shape)
             rel_depth = self.core(x)
-            # print("Output from midas shape", rel_depth.shape)
+
+            if isinstance(rel_depth, dict):
+                rel_depth = rel_depth.get(self.depth_key, None)
+                if rel_depth is None:
+                    available_keys = list(rel_depth.keys()) if rel_depth else []
+                    raise ValueError(f"ZoeCore.forward: '{self.depth_key}' key not found in rel_depth dict. Available keys: {available_keys}")
+            
             if not self.fetch_features:
                 return rel_depth
-        out = [self.core_out[k] for k in self.layer_names]
+            out = [self.core_out[k] for k in self.layer_names]
 
-        if return_rel_depth:
-            return rel_depth, out
-        return out
+            if return_rel_depth:
+                return rel_depth, out
+            return out
 
     def get_rel_pos_params(self):
         for name, p in self.core.pretrained.named_parameters():
@@ -254,38 +253,35 @@ class ZoeCore(nn.Module):
         if len(self.handles) > 0:
             self.remove_hooks()
         if "out_conv" in self.layer_names:
-            self.handles.append(list(zoe_model.scratch.output_conv.children())[
-                                3].register_forward_hook(get_activation("out_conv", self.core_out)))
+            self.handles.append(list(zoe_model.scratch.output_conv.children())[3].register_forward_hook(get_activation("out_conv", self.core_out)))
         if "r4" in self.layer_names:
-            self.handles.append(zoe_model.scratch.refinenet4.register_forward_hook(
-                get_activation("r4", self.core_out)))
+            self.handles.append(zoe_model.scratch.refinenet4.register_forward_hook(get_activation("r4", self.core_out)))
         if "r3" in self.layer_names:
-            self.handles.append(zoe_model.scratch.refinenet3.register_forward_hook(
-                get_activation("r3", self.core_out)))
+            self.handles.append(zoe_model.scratch.refinenet3.register_forward_hook(get_activation("r3", self.core_out)))
         if "r2" in self.layer_names:
-            self.handles.append(zoe_model.scratch.refinenet2.register_forward_hook(
-                get_activation("r2", self.core_out)))
+            self.handles.append(zoe_model.scratch.refinenet2.register_forward_hook(get_activation("r2", self.core_out)))
         if "r1" in self.layer_names:
-            self.handles.append(zoe_model.scratch.refinenet1.register_forward_hook(
-                get_activation("r1", self.core_out)))
+            self.handles.append(zoe_model.scratch.refinenet1.register_forward_hook(get_activation("r1", self.core_out)))
         if "l4_rn" in self.layer_names:
-            self.handles.append(zoe_model.scratch.layer4_rn.register_forward_hook(
-                get_activation("l4_rn", self.core_out)))
+            self.handles.append(zoe_model.scratch.layer4_rn.register_forward_hook(get_activation("l4_rn", self.core_out)))
 
         return self
 
     def remove_hooks(self):
         for h in self.handles:
             h.remove()
+        self.handles = [] 
         return self
 
     def __del__(self):
         self.remove_hooks()
 
     @staticmethod
-    def build(zoe_model_name="ZoeD_N", trainable=False, use_pretrained=True, fetch_features=False, freeze_bn=True, keep_aspect_ratio=True, img_size=384, **kwargs):
+    def build(zoe_model_name="ZoeD_N", trainable=False, use_pretrained=True, fetch_features=False, freeze_bn=True, keep_aspect_ratio=True, img_size=384, depth_key='metric_depth', **kwargs):
         # Load ZoeDepth model
         zoe_model = torch.hub.load("isl-org/ZoeDepth", zoe_model_name, pretrained=use_pretrained)
+        print(zoe_model)
         zoe_core = ZoeCore(zoe_model, trainable=trainable, fetch_features=fetch_features,
-                           freeze_bn=freeze_bn, keep_aspect_ratio=keep_aspect_ratio, img_size=img_size, **kwargs)
+                           freeze_bn=freeze_bn, keep_aspect_ratio=keep_aspect_ratio, 
+                           img_size=img_size, depth_key=depth_key, **kwargs)
         return zoe_core
