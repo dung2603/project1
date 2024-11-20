@@ -67,8 +67,12 @@ class BaseTrainer:
             self.model.eval()
 
         with torch.set_grad_enabled(training):
-            depth_map = self.model(images)
+            output = self.model(images)
             epsilon = 1e-6
+            if 'metric_depth' not in output:
+              raise KeyError("Output của mô hình không chứa key 'metric_depth'. Kiểm tra lại phương thức forward của mô hình.")
+        
+            depth_map = output['metric_depth']
             depth_map = F.softplus(depth_map) + epsilon  
 
             depth_map = self._resize_depth_map(depth_map, depths)
@@ -198,17 +202,17 @@ def main():
 
   
     model = CombinedDepthModel.build(
-    zoe_model_name="ZoeD_N",  
-    trainable=False,           
-    use_pretrained=True,      
-    fetch_features=True,
-    freeze_bn=True,
-    keep_aspect_ratio=True,
-    img_size=384,
-    semantic_feature_channels=21,  
-    unet_out_channels=1,        
-    bilinear=False
-)
+        zoe_model_name="ZoeD_N",          
+        trainable=False,                   
+        use_pretrained=True,              
+        fetch_features=True,
+        freeze_bn=True,
+        keep_aspect_ratio=True,
+        img_size=384,
+        semantic_feature_channels=21,      
+        unet_out_channels=1,               
+        bilinear=False
+    )
     transform = transforms.Compose([
         transforms.Resize((384, 384)),
         transforms.ToTensor(),
