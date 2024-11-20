@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.models.segmentation import deeplabv3_resnet50
 from typing import List
-
+from .unet_model import UNet
 # Import ZoeCore
 from .zoedepthcore import ZoeCore  # Adjust the import path as needed
 
